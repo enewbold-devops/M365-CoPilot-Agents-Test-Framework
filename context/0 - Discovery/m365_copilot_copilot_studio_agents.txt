@@ -1,0 +1,266 @@
+Microsoft 365 Copilot + Copilot Studio Agents: Monitoring, Evaluations, and Attachment Upload Scenarios
+================================================================================
+
+Date: February 24, 2026 (America/New_York)
+
+Context
+-------
+You want to start with:
+1) Copilot Declarative Agents for conversational experiences
+2) Copilot agent workflows
+…and then focus specifically on agents that support user uploads (attachments) during a conversation, including
+structured data files like CSV/XLSX/XML.
+
+This document consolidates our discussion into a practical architecture + measurement approach you can build on.
+
+--------------------------------------------------------------------------------
+1) Two layers of measurement: “Org Copilot impact” vs “Agent performance”
+--------------------------------------------------------------------------------
+
+A. Org-level Copilot adoption/impact
+- Goal: understand whether Microsoft 365 Copilot is being used and whether it’s delivering productivity lift.
+- Typical signals:
+  - Enabled vs active users (activation funnel)
+  - DAU/WAU/MAU and stickiness
+  - Feature usage mix (chat vs in-app experiences)
+  - Business impact proxies (time saved, meeting/email load, etc.)
+
+B. Agent-level quality/performance
+- Goal: determine whether specific agent experiences are succeeding, safely, and efficiently.
+- Four evaluation buckets:
+  1) Outcome / Task success
+     - Task completion rate
+     - Containment rate (resolved without escalation)
+     - Engaged vs unengaged sessions (where applicable)
+  2) Answer quality
+     - Groundedness/faithfulness to sources
+     - Relevance to user intent
+     - Tool/workflow correctness (right tool, correct parameters, correct sequence)
+  3) User experience
+     - Time-to-first-useful-answer
+     - Turns to resolution
+     - User feedback (thumbs up/down + comments where enabled)
+  4) Safety & compliance
+     - Content safety flags
+     - Jailbreak resistance
+     - Data leakage/PII checks
+
+Recommendation:
+- Compute an overall “Agent Score” (0–100) with weights, but apply a Safety Gate:
+  if a high-severity safety event occurs, mark the session/run as FAIL regardless of numeric score.
+
+--------------------------------------------------------------------------------
+2) Attachment uploads: what’s “uploaded in chat” vs “open document context”
+--------------------------------------------------------------------------------
+
+Attachments can mean two very different things:
+
+1) User uploads a file directly into the chat (attachments in the conversation UI)
+- Most straightforward in Copilot Studio:
+  - Enable file uploads
+  - Ask the user to upload a file in a topic
+  - Pass the file to an Agent Flow (Power Automate), connector, or tool
+
+2) Declarative agent interacts with an open document (Word/PowerPoint context)
+- This is document-context interaction (the file is already open in the host app).
+- It is not the same as a user uploading an arbitrary file into a chat UI.
+- For dynamic user uploads, Copilot Studio + flow/tooling patterns are the most reliable approach.
+
+--------------------------------------------------------------------------------
+3) Core implementation pattern: Copilot Studio Topic -> File request -> Agent Flow
+--------------------------------------------------------------------------------
+
+This is the recommended baseline architecture for file uploads during conversation.
+
+A. Topic pattern (conversation)
+1) Ask user to upload a file (file question node)
+2) Confirm user intent (what outcome they want)
+   - Summarize/extract
+   - Validate schema and data quality
+   - Transform/clean and return an output file
+   - Upsert into Dataverse / create ticket / route to queue
+3) Pass file(s) to an Agent Flow (Power Automate) or connector/tool
+4) Return results back to chat with a structured “audit” summary
+
+B. Agent Flow pattern (Power Automate)
+1) Deterministic gates
+   - validate file type and size
+   - sanity checks (row counts, sheet existence)
+   - malware scanning if available in your org’s pipeline
+2) Parse & normalize
+   - PDF/DOCX: extract text (OCR if scanned)
+   - Images: optional image analysis
+   - CSV/XLSX/XML: parse to normalized schema
+3) Data quality checks
+   - required fields present
+   - correct data types
+   - key uniqueness
+   - outlier/anomaly detection
+4) AI step (optional, after deterministic checks)
+   - summarize
+   - extract entities
+   - classify
+   - recommend actions
+5) Persist outputs
+   - store file in SharePoint/OneDrive
+   - create Dataverse record(s)
+   - attach file link + exceptions report
+6) Return outcome to user (ticket/record ID + summary + next actions)
+
+Why this pattern wins:
+- Durable storage & audit trail
+- Strong policy gates
+- Straightforward evaluation checkpoints
+- Easy Power BI reporting because workflow outputs are structured
+
+--------------------------------------------------------------------------------
+4) Scenarios we covered
+--------------------------------------------------------------------------------
+
+Scenario A: Upload a PDF -> Summarize + extract entities -> create ticket
+- Topic requests file
+- Flow extracts text (OCR if necessary)
+- AI extracts key fields (e.g., name, dates, issue type, priority)
+- Create ticket/record (ServiceNow/D365/Dataverse)
+- Return ticket number + summary + link to stored document
+
+Scenario B: Upload an RFP -> Generate response outline
+- Store file
+- Extract sections, requirements matrix
+- Return outline + compliance checklist + risks
+
+Scenario C: Upload evidence -> Classify + route
+- Route to correct queue based on extracted entities
+- Return classification + routing destination + confidence + any required follow-up
+
+Scenario D: Upload a spreadsheet/structured file (CSV/XLSX/XML)
+User story:
+- “I’m uploading a ledger/list. Validate it, summarize it, detect anomalies, and create/update records or return a cleaned file.”
+
+Recommended approach:
+- Treat it as a schema problem, not a chat problem:
+  - parse -> normalize -> validate -> then AI
+  - store both the raw file and normalized results
+
+Suggested internal (canonical) schema in Dataverse:
+- BatchUpload
+  - BatchId
+  - UploadedBy
+  - SourceFilename
+  - SourceType (csv/xlsx/xml)
+  - RowCount
+  - Status (Validated / Failed / Processed)
+  - ErrorsJson
+  - StorageUrl
+- BatchRow
+  - BatchId (FK)
+  - RowNumber
+  - NaturalKey (ClaimNumber / CustomerId / etc.)
+  - PayloadJson
+  - ValidationStatus
+  - ValidationErrors
+
+Useful variations:
+- Compare current upload to prior upload (diff added/removed/changed)
+- Generate an exceptions workbook: ValidRows + InvalidRows (with error reasons)
+- If XML is the contract: enforce schema validation rules + return node-level validation report
+
+--------------------------------------------------------------------------------
+5) Evaluations & scoring when attachments are involved
+--------------------------------------------------------------------------------
+
+You should track two layers:
+
+A. Conversation layer score
+- Did the agent request the right file?
+- Did the agent clarify intent correctly?
+- Did it explain results clearly (and propose next steps)?
+- User feedback score (thumbs up/down + comments)
+
+B. Workflow layer score
+- Parsing success (csv/xlsx/xml parsed correctly)
+- Schema compliance (required columns/nodes)
+- Data quality detection accuracy
+- Correct transformations (cleaning does not corrupt data)
+- Upsert correctness (create vs update, correct field mapping)
+- Performance (time to result)
+- Safety/compliance (PII handling, leakage prevention)
+
+Hard “fail gates” (don’t average these away):
+- Wrong import mapping (data goes into wrong fields)
+- Cross-user/tenant data leakage
+- Silent truncation without warning
+
+--------------------------------------------------------------------------------
+6) “What are the APIs for M365 Copilot monitoring/evaluations?” – Copilot Studio focus
+--------------------------------------------------------------------------------
+
+There is no single “Copilot Studio Monitoring API” that returns all analytics + evals in one call.
+In practice, for Copilot Studio channels, you standardize on:
+
+1) Dataverse Web API (OData) as your KPI warehouse
+- Agent definitions (e.g., bot, components) and transcript/session data can be stored in Dataverse.
+- Use Dataverse Web API to read/write evaluation results and scorecards.
+
+2) Azure Application Insights for deep telemetry
+- Best source for reliability signals:
+  latency distributions, dependency failures, connector/tool failures, error rates,
+  spikes in fallbacks, and custom events/dimensions.
+
+3) Microsoft Purview audit logs for governance
+- Track “who changed what” and lifecycle actions.
+- Useful for correlating regressions with agent changes.
+
+--------------------------------------------------------------------------------
+7) Channel differences: Web chat vs Teams vs Dynamics 365
+--------------------------------------------------------------------------------
+
+A. Web chat
+- Best for evaluation pipelines because Dataverse transcript + session data is typically accessible (subject to configuration).
+
+B. Teams channel
+- Transcript UX differs from web app experience.
+- Standardize your pipeline to run from central Dataverse + App Insights rather than relying on Teams client UX.
+
+C. Dynamics 365 channel
+- Often highest value for App Insights because you need correlation to:
+  cases/tickets, routing, SLAs, and operational outcomes.
+
+Recommendation:
+- Create a unified evaluation model that works across channels by:
+  - storing EvalRuns and EvalResults in Dataverse
+  - using App Insights for performance and reliability
+  - joining business outcomes (case created, import succeeded, etc.) to session/conversation IDs
+
+--------------------------------------------------------------------------------
+8) Suggested rollout plan
+--------------------------------------------------------------------------------
+
+Week 1: Baseline
+- Turn on App Insights telemetry for your agents
+- Enable transcript saving where policy allows
+- Define success criteria for your top 10–20 intents
+
+Week 2: Scorecard v1
+- Build Power BI scorecard:
+  - success rate
+  - fallback rate
+  - P95 latency
+  - top failure reasons taxonomy
+- Create Eval tables in Dataverse and start populating them
+
+Week 3+: Continuous improvement loop
+- Every agent change runs regression on a golden test set
+- Compare vs prior baseline
+- Slice analysis by intent, channel, file type, tool path, and user group
+
+--------------------------------------------------------------------------------
+9) Recommended “single pane of glass” architecture
+--------------------------------------------------------------------------------
+
+- Dataverse: session outcomes + transcript-derived KPIs + evaluation results + business outcomes
+- Application Insights: latency/errors/dependencies + custom telemetry (agent version, scenario type, channel)
+- Purview audit logs: governance, change tracking, compliance reporting
+
+================================================================================
+End of report

@@ -1,0 +1,505 @@
+GUIDE 01: DATAVERSE SCHEMA AND SETUP
+Microsoft 365 Copilot Studio Agent Framework
+Monitoring, Evaluation, and Testing Platform
+================================================================================
+Date: February 24, 2026
+Version: 1.0
+Audience: Power Platform Administrator, Solution Architect, Maker Lead
+================================================================================
+
+
+PURPOSE OF THIS GUIDE
+----------------------
+This guide establishes the Dataverse schema that acts as the central data layer for
+the entire M365 Copilot Studio agent monitoring, evaluation, and testing framework.
+Every other guide in this series — Power Automate flows, scoring formulas, Power BI
+reports, smoke testing, multi-agent test pipelines — reads from and writes to the
+tables defined here. Getting this layer right first is critical.
+
+Think of this Dataverse schema as your "evaluation warehouse." It is a structured,
+queryable, auditable record of everything your agents did, how well they did it, and
+how well they scored against your quality criteria. Because it is native to the Power
+Platform, it integrates naturally with Copilot Studio, Power Automate, and Power BI
+without requiring external ETL infrastructure to get started.
+
+
+PREREQUISITES
+-------------
+Before creating any tables, confirm the following:
+
+1. You have a Dataverse environment (not Dataverse for Teams — use a full Power
+   Platform environment). Note that Dataverse for Teams has significant quota and
+   schema constraints that will limit this framework.
+
+2. You have the System Administrator or System Customizer role in the target
+   Dataverse environment.
+
+3. You have a Microsoft Entra ID (Azure Active Directory) App Registration with
+   the Dataverse scope granted, for service-to-service API access. This is needed
+   for Power Automate flows and any external tooling that writes evaluation results.
+
+4. Your Copilot Studio agents are deployed to this same environment (or you have
+   cross-environment access configured).
+
+5. Transcript saving is enabled for your agents where governance policy allows.
+   This is configured per-agent in Copilot Studio under Settings > Security >
+   Transcript configuration.
+
+
+STEP 1: ENVIRONMENT DISCOVERY (DO THIS BEFORE BUILDING ANYTHING)
+-----------------------------------------------------------------
+A common mistake is guessing at Dataverse table names that Copilot Studio creates
+internally. Table names vary by environment type, version, and channel configuration.
+You must discover the actual table names in your environment first.
+
+Your Dataverse OData v4 base URL follows this pattern:
+  https://<your-org>.crm.dynamics.com/api/data/v9.2/
+
+All OData requests require these headers:
+  Authorization: Bearer <access_token>
+  Accept: application/json
+  OData-MaxVersion: 4.0
+  OData-Version: 4.0
+  Content-Type: application/json; charset=utf-8
+  Prefer: odata.include-annotations="*"
+  Prefer: odata.maxpagesize=500
+
+To get an access token, authenticate against Entra ID using your App Registration:
+  Scope: https://<your-org>.crm.dynamics.com/.default
+  Grant type: client_credentials (service-to-service) or authorization_code (delegated)
+
+Once you have a token, run these discovery queries in order.
+
+DISCOVERY QUERY 1 — List all table logical names:
+  GET /EntityDefinitions?$select=LogicalName,SchemaName,DisplayName
+
+This returns a large list. Save the output. You will search it for Copilot Studio
+table names in the next queries.
+
+DISCOVERY QUERY 2 — Search for transcript tables:
+  GET /EntityDefinitions?$select=LogicalName,SchemaName&$filter=contains(LogicalName,'transcript')
+  GET /EntityDefinitions?$select=LogicalName,SchemaName&$filter=contains(LogicalName,'conversation')
+  GET /EntityDefinitions?$select=LogicalName,SchemaName&$filter=contains(LogicalName,'bot')
+  GET /EntityDefinitions?$select=LogicalName,SchemaName&$filter=contains(SchemaName,'Bot')
+
+DISCOVERY QUERY 3 — Inspect columns of a discovered table:
+  GET /EntityDefinitions(LogicalName='conversationtranscripts')/Attributes?$select=LogicalName,AttributeType
+
+Replace 'conversationtranscripts' with any table name you discover.
+
+DISCOVERY QUERY 4 — Confirm primary key fields:
+  GET /EntityDefinitions(LogicalName='<logicalname>')?$select=PrimaryIdAttribute,PrimaryNameAttribute
+
+Record the logical names of these key tables that you discover:
+  - The transcript table (typically: conversationtranscripts)
+  - The bot session table (typically: msdyn_botsessions, but verify)
+  - The bot definition table (typically: bots)
+  - The bot component table (typically: botcomponents)
+
+You will reference these discovered names in the queries in Guide 08 (query templates)
+and in the Power BI data model built in Guide 04.
+
+
+STEP 2: AUTHENTICATION SETUP FOR SERVICE ACCOUNTS
+--------------------------------------------------
+For the Power Automate flows and any scheduled evaluation pipelines to write to
+Dataverse, you need a properly configured service identity.
+
+Option A — Service Principal (recommended for production):
+  1. Register an App Registration in Entra ID.
+  2. Add the "Dynamics CRM — user_impersonation" API permission.
+  3. In Dataverse, go to Settings > Application Users.
+  4. Create an Application User linked to your App Registration.
+  5. Assign the Application User to a custom security role that has:
+     - Create, Read, Write, Delete on all custom tables you define below.
+     - Read on bot, botcomponent, conversationtranscripts, msdyn_botsessions.
+  6. Store the client ID and client secret in Azure Key Vault.
+  7. Reference Key Vault secrets from Power Automate via the Key Vault connector.
+
+Option B — Connection with user credentials (acceptable for non-production):
+  Use a dedicated service account with the correct Dataverse roles. Not recommended
+  for production because it ties credentials to a user license.
+
+
+STEP 3: CUSTOM TABLE DEFINITIONS
+---------------------------------
+Create each table in Dataverse using the Power Apps maker portal
+(make.powerapps.com) or via a solution. Always create custom tables inside a named
+solution so they can be exported and promoted through environments. Use a consistent
+publisher prefix throughout — this guide uses "new_" as an example. Replace this
+with your organization's actual publisher prefix.
+
+-------------------------------------------------------------------------------
+TABLE: new_EvalRun
+PURPOSE: One record per test/evaluation execution. This is the top-level container
+for a batch of evaluation results across one or more sessions.
+-------------------------------------------------------------------------------
+
+Column Name              | Type          | Notes
+-------------------------|---------------|------------------------------------------
+new_evalrunid            | GUID (PK)     | Auto-generated primary key
+new_name                 | Text (150)    | Human-readable run label. Example:
+                         |               | "Nightly Regression 2026-02-24"
+new_agentid              | Lookup (bots) | FK to the bot/agent being evaluated
+new_agentversion         | Text (100)    | Agent version label at time of run
+new_channel              | Choice        | Options: Web (100000000),
+                         |               | Teams (100000001), D365 (100000002)
+new_datasetname          | Text (200)    | Name of the test set used. Example:
+                         |               | "Golden-FileUpload-CSV-v1"
+new_trigger              | Choice        | Options: Manual (100000000),
+                         |               | Scheduled (100000001),
+                         |               | Pipeline (100000002)
+new_startedon            | DateTime      | UTC timestamp when run began
+new_completedon          | DateTime      | UTC timestamp when run finished
+new_status               | Choice        | Options: Running (100000000),
+                         |               | Passed (100000001),
+                         |               | Failed (100000002),
+                         |               | Blocked (100000003)
+new_totaltestcases       | Integer       | Total number of test cases in this run
+new_passcount            | Integer       | Count of test cases that passed
+new_failcount            | Integer       | Count of test cases that failed
+new_hardfailcount        | Integer       | Count that triggered a safety hard-fail
+new_overallscore         | Decimal       | Weighted score 0–100 for this run
+new_baselinerunid        | Lookup        | Self-lookup to prior baseline EvalRun
+new_scoredelta           | Decimal       | Difference vs baseline (positive = better)
+new_notes                | Text (2000)   | Free text notes on this run
+
+-------------------------------------------------------------------------------
+TABLE: new_EvalResult
+PURPOSE: One record per test case execution within an EvalRun. Contains all
+per-session scores, flags, and identifiers needed for root cause analysis.
+-------------------------------------------------------------------------------
+
+Column Name              | Type          | Notes
+-------------------------|---------------|------------------------------------------
+new_evalresultid         | GUID (PK)     | Auto-generated primary key
+new_name                 | Text (150)    | Human-readable label
+new_evalrunid            | Lookup        | FK to new_EvalRun (parent)
+new_testcaseid           | Lookup        | FK to new_TestCase (what was tested)
+new_conversationid       | Text (200)    | ConversationId from Copilot Studio
+new_sessionid            | Text (200)    | SessionId if available
+new_transcriptid         | Text (200)    | Dataverse GUID of transcript record
+new_agentid              | Lookup (bots) | Agent that was invoked
+new_agentversion         | Text (100)    | Agent version at execution time
+new_channel              | Choice        | Same options as EvalRun.new_channel
+new_tasksuccess          | Boolean       | Did the agent complete the intended task?
+new_groundingscore       | Decimal       | 0.00–1.00. Grounding/faithfulness score
+new_toolcorrectness      | Decimal       | 0.00–1.00. Right tool, right params, order
+new_latencyms            | Integer       | End-to-end latency in milliseconds
+new_turnstoResolution    | Integer       | Number of conversational turns needed
+new_userfeedback         | Choice        | ThumbsUp (1), ThumbsDown (-1), None (0)
+new_safetyseverity       | Choice        | None (0), Low (1), Medium (2), High (3)
+new_ishardfail           | Boolean       | True if safety gate was triggered
+new_overallscore         | Decimal       | Computed weighted score 0–100 for this
+                         |               | result. See Guide 03 for formula.
+new_failurereason        | Choice        | Taxonomy of failure types. Options:
+                         |               | None (100000000)
+                         |               | ParseFailed (100000001)
+                         |               | SchemaViolation (100000002)
+                         |               | UpsertError (100000003)
+                         |               | WrongFieldMapping (100000004)
+                         |               | SilentTruncation (100000005)
+                         |               | DataLeakage (100000006)
+                         |               | GroundingFailed (100000007)
+                         |               | ToolMismatch (100000008)
+                         |               | Timeout (100000009)
+                         |               | Other (100000010)
+new_failuredetails       | Text (4000)   | Free text / JSON detail on failure
+new_evalartifactid       | Lookup        | FK to new_EvalArtifact (if applicable)
+new_createdon            | DateTime      | Auto-set by Dataverse
+
+-------------------------------------------------------------------------------
+TABLE: new_EvalArtifact
+PURPOSE: Links an evaluation result to stored files. Tracks the uploaded file,
+the exception report, and any cleaned output file produced by the agent flow.
+-------------------------------------------------------------------------------
+
+Column Name              | Type          | Notes
+-------------------------|---------------|------------------------------------------
+new_evalartifactid       | GUID (PK)     | Auto-generated primary key
+new_name                 | Text (150)    | Label
+new_evalresultid         | Lookup        | FK to new_EvalResult
+new_inputfileurl         | Text (500)    | SharePoint/OneDrive URL of input file
+new_inputfiletype        | Choice        | CSV (1), XLSX (2), XML (3), PDF (4),
+                         |               | DOCX (5), Other (6)
+new_inputfilesizebytes   | Integer       | Size of input file in bytes
+new_exceptionreporturl   | Text (500)    | URL of exception report file
+new_outputfileurl        | Text (500)    | URL of cleaned/transformed output file
+new_rowcount             | Integer       | Total rows in input file
+new_validrowcount        | Integer       | Rows that passed validation
+new_invalidrowcount      | Integer       | Rows that failed validation
+new_toplvalidationerrors | Text (2000)   | JSON array of top validation error reasons
+
+-------------------------------------------------------------------------------
+TABLE: new_BatchUpload
+PURPOSE: Tracks every file attachment processed through an agent flow in
+production or test sessions. This is the production companion to new_EvalArtifact.
+One record per file submitted to an agent.
+-------------------------------------------------------------------------------
+
+Column Name              | Type          | Notes
+-------------------------|---------------|------------------------------------------
+new_batchuploadid        | GUID (PK)     | Auto-generated primary key
+new_name                 | Text (150)    | Typically the source filename
+new_conversationid       | Text (200)    | Link back to the conversation
+new_agentid              | Lookup (bots) | Agent that received the file
+new_uploadedby           | Lookup (user) | User who uploaded the file
+new_sourcefilename       | Text (300)    | Original filename
+new_filetype             | Choice        | Same options as new_EvalArtifact
+                         |               | new_inputfiletype
+new_filesizebytes        | Integer       | File size in bytes
+new_storageurl           | Text (500)    | Canonical storage URL (SharePoint)
+new_rowcount             | Integer       | Rows in the input file
+new_validrowcount        | Integer       | Rows that passed validation
+new_invalidrowcount      | Integer       | Rows that failed validation
+new_status               | Choice        | Pending (100000000)
+                         |               | ValidatedOK (100000001)
+                         |               | ValidatedWithErrors (100000002)
+                         |               | Failed (100000003)
+                         |               | Processed (100000004)
+new_errorsjson           | Text (4000)   | JSON array of error objects
+new_exceptionreporturl   | Text (500)    | URL of generated exception report file
+new_istestdata           | Boolean       | True if record was created via testing
+                         |               | pipeline. Used for cleanup jobs.
+new_createdon            | DateTime      | Auto-set
+
+-------------------------------------------------------------------------------
+TABLE: new_BatchRow
+PURPOSE: One record per row within a BatchUpload. Allows row-level validation
+tracking, upsert audit, and per-row error diagnosis.
+-------------------------------------------------------------------------------
+
+Column Name              | Type          | Notes
+-------------------------|---------------|------------------------------------------
+new_batchrowid           | GUID (PK)     | Auto-generated primary key
+new_name                 | Text (150)    | Typically "BatchId / RowNumber"
+new_batchuploadid        | Lookup        | FK to new_BatchUpload
+new_rownumber            | Integer       | 1-based row number in source file
+new_naturalkey           | Text (200)    | Business key (e.g., ClaimNumber)
+new_payloadjson          | Text (8000)   | Normalized row as JSON object
+new_validationstatus     | Choice        | Valid (100000000), Invalid (100000001)
+new_validationerrors     | Text (2000)   | Comma-separated or JSON error list
+new_upsertaction         | Choice        | Created (100000000), Updated (100000001)
+                         |               | Skipped (100000002), Failed (100000003)
+new_createdon            | DateTime      | Auto-set
+
+ALTERNATE KEY for new_BatchRow:
+  Create an alternate key on (new_batchuploadid, new_naturalkey).
+  This enables upsert via PATCH with the alternate key in the URL, which prevents
+  duplicate rows when flows retry after a transient failure.
+
+-------------------------------------------------------------------------------
+TABLE: new_TestCase
+PURPOSE: Stores the golden dataset of test inputs and expected outcomes. One record
+per test scenario. This is the source of truth for the test harness described in
+Guide 06.
+-------------------------------------------------------------------------------
+
+Column Name              | Type          | Notes
+-------------------------|---------------|------------------------------------------
+new_testcaseid           | GUID (PK)     | Auto-generated primary key
+new_name                 | Text (200)    | Descriptive scenario name. Example:
+                         |               | "Upload CSV with missing required column"
+new_agentid              | Lookup (bots) | Agent this test case targets
+new_testsetname          | Text (100)    | Group label. Examples: "Golden",
+                         |               | "Regression", "Edge", "Safety"
+new_priority             | Choice        | P0-Smoke (100000000),
+                         |               | P1-Regression (100000001),
+                         |               | P2-Extended (100000002)
+new_scenariotype         | Choice        | FileUpload-CSV (100000000),
+                         |               | FileUpload-XLSX (100000001),
+                         |               | FileUpload-XML (100000002),
+                         |               | FileUpload-PDF (100000003),
+                         |               | FAQ (100000004),
+                         |               | Routing (100000005),
+                         |               | Safety (100000006),
+                         |               | Performance (100000007)
+new_inputprompt          | Text (2000)   | The conversation message to send
+new_inputfileurl         | Text (500)    | URL of test file in SharePoint test library
+new_expectedoutcome      | Text (2000)   | Structured description of expected result
+new_expectedtasksuccess  | Boolean       | Should this case produce a task success?
+new_expectedparseresult  | Choice        | Success (1), Fail (0), N/A (2)
+new_expectedrowcount     | Integer       | Rows expected to be valid (nullable)
+new_expectedtools        | Text (2000)   | JSON: tools/flows expected to fire,
+                         |               | in expected order
+new_expectedlatencyms    | Integer       | Maximum acceptable latency (SLO)
+new_issafetytest         | Boolean       | True if this is a safety/compliance case
+new_isactive             | Boolean       | False = excluded from test runs
+new_createdon            | DateTime      | Auto-set
+new_notes                | Text (2000)   | Authoring notes
+
+-------------------------------------------------------------------------------
+TABLE: new_AgentTestConfig
+PURPOSE: Per-agent configuration for the test harness. Controls thresholds,
+baseline references, and which test sets are required. One record per agent.
+-------------------------------------------------------------------------------
+
+Column Name                | Type          | Notes
+---------------------------|---------------|----------------------------------------
+new_agenttestconfigid      | GUID (PK)     | Auto-generated primary key
+new_name                   | Text (150)    | Typically the agent display name
+new_agentid                | Lookup (bots) | FK to the bot/agent. Set as alternate key.
+new_baselinerunid          | Lookup        | FK to new_EvalRun (last known-good run)
+new_scoredroptreshold      | Decimal       | Points drop that triggers regression alert
+                           |               | Example: 5.0 means alert if score drops
+                           |               | more than 5 points vs baseline.
+new_latencysloms           | Integer       | P95 latency SLO in milliseconds
+new_requiredfedtests       | Text (500)    | Multi-value: which test sets are required
+                           |               | before deployment. Example:
+                           |               | "Golden,Safety,Edge"
+new_maxhardfailsallowed    | Integer       | Always 0 for production gates
+new_isenabled              | Boolean       | False = agent excluded from harness
+new_notificationemail      | Text (200)    | Alert recipient email address
+new_lasttestrunon          | DateTime      | Timestamp of last harness execution
+new_notes                  | Text (2000)   | Config notes
+
+
+STEP 4: SOLUTION PACKAGING AND ENVIRONMENT PROMOTION
+-----------------------------------------------------
+Always build the schema inside a named Dataverse solution. A solution makes all
+customizations portable and promotable across environments (Development → UAT → Production).
+
+Steps:
+  1. In your Development environment, create a new Solution named something like:
+     "AgentEvalFramework_v1"
+  2. Set the publisher prefix that matches your org's convention.
+  3. Add all seven custom tables to this solution.
+  4. Export the solution (Managed for promotion, Unmanaged for continued development).
+  5. Import the Managed solution into UAT, then Production.
+
+When schema changes are needed:
+  - Increment the solution version.
+  - Export from Dev, import to UAT for testing, then promote to Production.
+  - Never make schema changes directly in Production.
+
+
+STEP 5: SECURITY ROLES
+-----------------------
+Create a custom security role named "Agent Eval Framework - Contributor" with:
+  - Create, Read, Write, Delete (Organization scope) on all seven custom tables.
+  - Read (Organization scope) on: bots, botcomponents, conversationtranscripts,
+    msdyn_botsessions.
+  - Append and Append To on all custom tables (needed for lookup relationships).
+
+Assign this role to:
+  - The Application User created in Step 2 (service principal).
+  - Any Power Automate connections that write to these tables.
+  - Power BI gateway service account (Read only is sufficient for Power BI).
+
+
+STEP 6: OData QUERY TEMPLATES FOR COMMON OPERATIONS
+-----------------------------------------------------
+These are reusable query patterns that Power Automate flows, test harnesses, and
+external tools will use. See Guide 02 for their use inside flows.
+
+READ: List all agents
+  GET https://<org>.crm.dynamics.com/api/data/v9.2/bots?$select=botid,name,modifiedon
+
+READ: List transcripts modified after a watermark date
+  GET https://<org>.crm.dynamics.com/api/data/v9.2/conversationtranscripts
+    ?$select=conversationtranscriptid,modifiedon,conversationid,channel,transcript
+    &$filter=modifiedon ge 2026-02-24T00:00:00Z
+    &$orderby=modifiedon asc
+
+  Pagination: Dataverse returns @odata.nextLink when results exceed page size.
+  Always follow the nextLink in a loop until there is no nextLink in the response.
+
+READ: Query sessions for one agent in a time range
+  GET https://<org>.crm.dynamics.com/api/data/v9.2/msdyn_botsessions
+    ?$select=msdyn_botsessionid,createdon,conversationid,channel,botid,outcome
+    &$filter=createdon ge 2026-02-24T00:00:00Z and botid eq <bot-guid>
+
+READ: Get TestCases for an agent and a specific test set
+  GET https://<org>.crm.dynamics.com/api/data/v9.2/new_testcases
+    ?$select=new_testcaseid,new_name,new_inputprompt,new_inputfileurl,
+             new_expectedtasksuccess,new_priority
+    &$filter=_new_agentid_value eq '<agent-guid>'
+             and new_testsetname eq 'Golden'
+             and new_isactive eq true
+
+CREATE: Write a new EvalRun
+  POST https://<org>.crm.dynamics.com/api/data/v9.2/new_evalruns
+  Body:
+  {
+    "new_name": "Nightly Regression 2026-02-24 - RFP Agent",
+    "new_agentversion": "2.1.4",
+    "new_channel": 100000001,
+    "new_datasetname": "Golden-FileUpload-CSV-v1",
+    "new_trigger": 100000001,
+    "new_startedon": "2026-02-24T02:00:00Z",
+    "new_status": 100000000,
+    "bots_new_evalruns@odata.bind": "/bots(<bot-guid>)"
+  }
+
+UPDATE: Mark EvalRun as complete
+  PATCH https://<org>.crm.dynamics.com/api/data/v9.2/new_evalruns(<run-guid>)
+  Body:
+  {
+    "new_status": 100000001,
+    "new_completedon": "2026-02-24T02:45:00Z",
+    "new_totaltestcases": 24,
+    "new_passcount": 22,
+    "new_failcount": 2,
+    "new_hardfailcount": 0,
+    "new_overallscore": 91.5
+  }
+
+CREATE: Write an EvalResult
+  POST https://<org>.crm.dynamics.com/api/data/v9.2/new_evalresults
+  Body:
+  {
+    "new_name": "Run 2026-02-24 / TestCase Upload-CSV-Valid",
+    "new_evalrunid@odata.bind": "/new_evalruns(<run-guid>)",
+    "new_testcaseid@odata.bind": "/new_testcases(<testcase-guid>)",
+    "new_conversationid": "abc123",
+    "new_tasksuccess": true,
+    "new_groundingscore": 0.94,
+    "new_toolcorrectness": 0.88,
+    "new_latencyms": 3420,
+    "new_turnstoResolution": 3,
+    "new_safetyseverity": 0,
+    "new_ishardfail": false,
+    "new_overallscore": 93.2,
+    "new_failurereason": 100000000
+  }
+
+UPSERT: BatchRow using alternate key
+  PATCH https://<org>.crm.dynamics.com/api/data/v9.2/new_batchrows
+        (new_batchuploadid=<upload-guid>,new_naturalkey='C12345')
+  Body:
+  {
+    "new_payloadjson": "{\"ClaimNumber\":\"C12345\",\"Amount\":1500.00}",
+    "new_validationstatus": 100000000,
+    "new_upsertaction": 100000001
+  }
+
+
+STEP 7: INCREMENTAL LOAD STRATEGY
+----------------------------------
+For high-volume environments, do not query all transcripts or sessions on every run.
+Use a watermark-based incremental approach:
+
+  1. Store the last successful watermark timestamp in a Dataverse configuration
+     record (or an environment variable in Power Automate).
+  2. On each pipeline run, query transcripts filtered by modifiedon >= last_watermark.
+  3. Process the returned records.
+  4. After successful processing, update the watermark to the max(modifiedon)
+     from the batch just processed.
+  5. On failure, do not advance the watermark — allow re-processing.
+
+This approach prevents gaps and avoids duplicate processing when used with the
+upsert patterns defined above.
+
+
+NEXT STEPS
+----------
+With the schema in place:
+  - Proceed to Guide 02 to build the Power Automate cloud flow and Agent Flow
+    that writes BatchUpload, BatchRow, and EvalResult records.
+  - Proceed to Guide 04 to connect Power BI to these tables via the Dataverse connector.
+  - Proceed to Guide 06 to understand how the TestCase and AgentTestConfig tables
+    are used by the multi-agent test harness.
+
+================================================================================
+END OF GUIDE 01
+================================================================================

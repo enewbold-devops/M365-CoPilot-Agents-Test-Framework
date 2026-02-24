@@ -1,0 +1,440 @@
+GUIDE 05: SMOKE TEST AGENT AND FLOW
+Microsoft 365 Copilot Studio Agent Framework
+Monitoring, Evaluation, and Testing Platform
+================================================================================
+Date: February 24, 2026
+Version: 1.0
+Audience: Power Platform Maker, QA Engineer, Operations Lead
+================================================================================
+
+
+PURPOSE OF THIS GUIDE
+----------------------
+This guide covers the design, implementation, and operation of a dedicated smoke
+test agent in Copilot Studio. The smoke test agent is a lightweight, separately
+deployed agent whose sole purpose is to rapidly verify that the entire Power Platform
+and integration stack is operational before any production workloads or regression
+test suites are executed.
+
+Think of the smoke test agent as the "canary in the coal mine." If it fails, you
+know immediately that a platform-level issue exists — not a logic issue in your
+production agents — and you can halt further testing or escalate before wasting
+time running expensive regression suites against a broken platform.
+
+This guide covers:
+  - Why the smoke test agent must be completely separate from production agents
+  - How to design it in Copilot Studio
+  - The accompanying Agent Flow architecture for smoke testing
+  - Scheduled execution using a cloud flow
+  - App Insights telemetry schema for smoke test runs
+  - Consecutive failure detection and P0 alert escalation
+  - Integration with the multi-agent test harness (Guide 06)
+
+
+SECTION 1: WHY A SEPARATE SMOKE TEST AGENT
+--------------------------------------------
+There are three critical reasons why the smoke test agent must be a distinct agent,
+not a test topic within a production agent.
+
+REASON 1 — Transcript isolation:
+  Every conversation in a Copilot Studio agent is recorded in the Dataverse
+  conversationtranscripts table (if transcripts are enabled). Smoke test
+  conversations are synthetic — they are not real user sessions. If they are run
+  inside a production agent, they pollute the transcript table, corrupt adoption
+  metrics (inflating session counts), and contaminate the evaluation pipeline
+  with non-user sessions.
+
+REASON 2 — Failure isolation:
+  If the smoke test fails because the Dataverse connector is down, you want to
+  know it is a platform failure, not a production agent topic bug. By running the
+  smoke test on a completely separate agent, you eliminate the question of whether
+  a production agent's configuration contributed to the failure.
+
+REASON 3 — Independent versioning:
+  Production agents are version-controlled and may be in different deployment states
+  across environments (Dev, UAT, Production). The smoke test agent should always be
+  at a fixed, stable version that does not change unless the underlying integration
+  pattern changes. This ensures the smoke test is a reliable baseline and is not
+  affected by production agent release cadence.
+
+
+SECTION 2: SMOKE TEST AGENT DESIGN IN COPILOT STUDIO
+-------------------------------------------------------
+Create a new agent in Copilot Studio named: "Platform Smoke Test Agent"
+Set a clear description indicating this is an internal test agent and should not
+be published to end users.
+
+2.1 Topics to Create
+
+  TOPIC 1: Greeting and Self-Identification
+    Trigger: System trigger (start of conversation)
+    Content: "I am the Platform Smoke Test Agent. This conversation is an
+    automated health check. ConversationId: {System.Conversation.Id}"
+    Purpose: Ensures the agent starts, the topic fires, and a ConversationId
+    is generated. This verifies the minimal Copilot Studio runtime.
+
+  TOPIC 2: Smoke Test Orchestration
+    Trigger: Message = "run smoke test" (used by the scheduled cloud flow)
+    Content:
+      NODE 1: Set a variable Topic.RunId to a generated GUID (use a formula or
+              pass it in via an input parameter if supported).
+      NODE 2: Call the Smoke Test Agent Flow (built in Section 3).
+              Pass: ConversationId, RunId, Timestamp.
+              Receive: OverallStatus, DataverseOK, FlowOK, FileUploadOK,
+                       SharePointOK, GraphOK, LatencyMs, FailureDetails
+      NODE 3: Return a structured report message:
+        "Smoke Test Result:
+         - Overall: {OverallStatus}
+         - Dataverse write: {DataverseOK}
+         - Flow invocation: {FlowOK}
+         - File upload path: {FileUploadOK}
+         - SharePoint write: {SharePointOK}
+         - Graph API: {GraphOK}
+         - Latency: {LatencyMs}ms
+         Run ID: {RunId}"
+    Purpose: This is the main health check topic. Every dependency is tested and
+    the result is returned to the caller.
+
+  TOPIC 3: Status (optional)
+    Trigger: "status" or "health"
+    Content: Returns the timestamp and status of the last smoke test run by
+    querying a Dataverse configuration record that the flow updates.
+    Purpose: Allows a human operator to quickly check the last smoke test result
+    without triggering a new run.
+
+2.2 Publishing and Access
+  Publish the smoke test agent to the Web channel only.
+  Restrict the Direct Line secret/token to the service identity running the
+  scheduled cloud flow. Do not share the Direct Line secret broadly.
+  Do not publish this agent to Teams or any employee-facing channel.
+  Disable the default "Get started" welcome message so it does not appear in any
+  accidental user-facing contexts.
+
+
+SECTION 3: SMOKE TEST AGENT FLOW ARCHITECTURE
+-----------------------------------------------
+Create a dedicated Cloud Flow named: "AgentFlow-SmokeTest"
+This flow is a "Power Virtual Agents" type flow triggered when the smoke test topic
+calls it. It is separate from the production agent flows and has no business logic —
+only platform connectivity checks.
+
+3.1 Input parameters to the flow:
+  ConversationId  — String
+  RunId           — String (GUID)
+  Timestamp       — DateTime
+
+3.2 Output parameters from the flow:
+  OverallStatus   — String (OK / DEGRADED / FAILED)
+  DataverseOK     — Boolean
+  FlowOK          — Boolean
+  FileUploadOK    — Boolean
+  SharePointOK    — Boolean
+  GraphOK         — Boolean (optional, test Graph API connector)
+  LatencyMs       — Integer (end-to-end duration)
+  FailureDetails  — String (JSON with details of any failures)
+
+3.3 Flow Steps
+
+  STEP 0: Record start time
+    Use a Compose action: StartTime = utcNow()
+
+  STEP 1: Dataverse Write Test
+    Attempt to create a test record in Dataverse.
+    Use the new_BatchUpload table. Write a record with:
+      new_sourcefilename = "SmokeTest_" + RunId + ".csv"
+      new_istestdata = true
+      new_status = 100000000 (Pending)
+    If the create succeeds:
+      Set DataverseOK = true
+      Capture the created record GUID as SmokeRecordId
+    If it fails:
+      Set DataverseOK = false
+      Append failure detail: "Dataverse write failed: " + error message
+
+  STEP 2: Dataverse Read Test
+    Retrieve the record just created using the SmokeRecordId.
+    Confirm the retrieved record's new_sourcefilename matches what was written.
+    If mismatch or error:
+      Set DataverseOK = false
+      Append failure detail: "Dataverse read/verify failed"
+
+  STEP 3: Dataverse Delete (cleanup)
+    Delete the smoke test record created in Step 1.
+    This prevents accumulation of smoke test records over time.
+    If delete fails: Log as a warning but do not fail the smoke test overall.
+
+  STEP 4: Agent Flow Connectivity Test
+    Invoke a minimal "echo" action — this can simply be a Compose action that
+    formats a string. The purpose is to confirm the flow engine can run a step
+    without error after the Dataverse operations.
+    Set FlowOK = true if this step completes.
+    Note: FlowOK is inherently true if the flow is running at all, but making
+    it explicit as a step generates a named telemetry event for tracking.
+
+  STEP 5: SharePoint Write Test
+    Attempt to create a small test file in the agent file storage library.
+    File: /SmokeTests/{RunId}/smoketest.txt
+    Content: "Smoke test file — safe to delete. RunId: {RunId}"
+    If create succeeds:
+      Set SharePointOK = true
+      Delete the file immediately (cleanup).
+    If fails:
+      Set SharePointOK = false
+      Append failure detail: "SharePoint write failed: " + error message
+
+  STEP 6: File Upload Path Test (simulated)
+    Use an HTTP action to perform a GET request to the agent file storage library
+    root folder using the SharePoint connector. Confirm the HTTP response is 200.
+    This verifies the file storage path is accessible (a full upload simulation
+    would require a real file, which is unnecessary for smoke testing).
+    If response is 200: Set FileUploadOK = true.
+    If fails: Set FileUploadOK = false. Append failure detail.
+
+  STEP 7: Graph API Test (optional)
+    If your agents use Graph API connectors (e.g., to read user profile, check
+    mailbox, or access Teams), add a lightweight Graph API call here.
+    Recommended: GET /me (returns the service account profile).
+    If response is 200: Set GraphOK = true.
+    If fails: Set GraphOK = false. Append failure detail: "Graph API unavailable"
+
+  STEP 8: Compute overall status
+    If all checks pass: OverallStatus = "OK"
+    If one or more non-critical checks fail: OverallStatus = "DEGRADED"
+    If DataverseOK = false OR SharePointOK = false: OverallStatus = "FAILED"
+    (Dataverse and SharePoint are considered critical. Graph is informational.)
+
+  STEP 9: Compute latency
+    LatencyMs = DateTimeToTicks(utcNow()) - DateTimeToTicks(StartTime)
+    Convert to milliseconds.
+
+  STEP 10: Emit App Insights event
+    POST to App Insights ingestion endpoint.
+    Event name: SmokeTestRun
+    Properties:
+      runId, conversationId, overallStatus, dataverseOK, flowOK,
+      fileUploadOK, sharePointOK, graphOK, latencyMs, timestamp,
+      agentEnvironment (DEV / UAT / PROD — injected as flow variable)
+
+  STEP 11: Write SmokeTestRun summary to Dataverse
+    Create or upsert a record in a simple Dataverse configuration table
+    (e.g., new_smoketestlog) with:
+      new_runid, new_status, new_latencyms, new_createdon, new_failuredetails
+    This allows the Status topic (Section 2.1, TOPIC 3) to read the latest result.
+
+  STEP 12: Return outputs to topic
+    Return OverallStatus, DataverseOK, FlowOK, FileUploadOK, SharePointOK,
+    GraphOK, LatencyMs, FailureDetails.
+
+
+SECTION 4: SCHEDULED EXECUTION
+---------------------------------
+The smoke test should run on a regular schedule to continuously verify platform
+health — not just on demand.
+
+4.1 Create a Scheduled Cloud Flow
+  Name: "Scheduled-SmokeTest-Trigger"
+  Trigger: Recurrence
+    Frequency: Every 30 minutes (or hourly for lower-criticality environments)
+    Time zone: Use UTC to avoid daylight saving ambiguities in timestamps.
+
+4.2 What the Scheduled Flow Does
+  The scheduled cloud flow cannot directly call a Copilot Studio topic. Instead,
+  it sends a message to the smoke test agent via Direct Line.
+
+  Steps in the scheduled cloud flow:
+
+  STEP A: Get Direct Line token
+    Use HTTP action to POST to the Direct Line token endpoint:
+      POST https://directline.botframework.com/v3/directline/tokens/generate
+      Authorization: Bearer <DirectLine_Secret>
+    Capture the token from the response.
+    Store the Direct Line Secret in Azure Key Vault and reference it via the
+    Key Vault connector — never hardcode secrets in Flow actions.
+
+  STEP B: Start a conversation over Direct Line
+      POST https://directline.botframework.com/v3/directline/conversations
+      Authorization: Bearer {token_from_step_A}
+    Capture the conversationId from the response.
+
+  STEP C: Send the trigger message
+      POST https://directline.botframework.com/v3/directline/conversations/{conversationId}/activities
+      Body:
+      {
+        "type": "message",
+        "from": { "id": "smoke-test-scheduler" },
+        "text": "run smoke test"
+      }
+
+  STEP D: Poll for response (with timeout)
+    Direct Line responses are pulled via polling:
+      GET https://directline.botframework.com/v3/directline/conversations/{conversationId}/activities?watermark={watermark}
+    Poll every 3 seconds for up to 120 seconds.
+    Stop polling when a message from the bot is received or timeout is reached.
+
+  STEP E: Parse the response
+    Extract OverallStatus, LatencyMs, and FailureDetails from the bot response message.
+
+  STEP F: Evaluate result and alert if needed
+    If OverallStatus = "FAILED" or OverallStatus = "DEGRADED":
+      Increment a consecutive failure counter stored in a Dataverse config record.
+    If OverallStatus = "OK":
+      Reset the consecutive failure counter to 0.
+    If consecutive failure counter >= 3:
+      Trigger P0 alert (see Section 5).
+
+  STEP G: Update Power BI dataset (optional)
+    Make a call to the Power BI REST API to trigger a dataset refresh so the
+    smoke test status appears immediately on the Page 1 scorecard dashboard.
+
+4.3 Failure Counter Persistence
+  Store the consecutive failure counter in a simple Dataverse configuration table
+  record (e.g., new_smoketestlog, field: new_consecutivefailures).
+  The scheduled flow reads this value at the start of each run and updates it
+  at the end. This persists across flow invocations.
+
+
+SECTION 5: CONSECUTIVE FAILURE DETECTION AND P0 ALERT
+-------------------------------------------------------
+Three consecutive failures of the smoke test is the trigger for a P0 alert.
+Three is chosen (rather than one) to avoid false alarms from transient platform
+blips (e.g., a brief Dataverse maintenance window or a momentary network timeout).
+
+P0 ALERT ACTIONS (ALL MUST EXECUTE):
+
+  ACTION 1: Send an immediate email
+    From: the service account
+    To: the on-call operations lead + QA lead
+    Subject: "[P0 ALERT] Copilot Agent Smoke Test — 3 Consecutive Failures"
+    Body:
+      Environment: {PROD/UAT/DEV}
+      First failure: {timestamp of first failure in current streak}
+      Last failure: {timestamp}
+      Consecutive count: {count}
+      Failure details: {FailureDetails JSON}
+      Action required: Investigate platform health immediately.
+      Link to Power BI report: {dashboard URL}
+
+  ACTION 2: Post an adaptive card to the "Agent Quality Alerts" Teams channel
+    Include the same information as the email, formatted as an adaptive card.
+    Include action buttons: "View Dashboard", "View EvalRun in Dataverse",
+    "Acknowledge Incident".
+
+  ACTION 3: Create an incident record in your ITSM system
+    If your organization uses ServiceNow, D365 Customer Service, or another ITSM:
+    Create a P1/P0 incident record automatically via the appropriate connector.
+    Include: impact description, affected services, first/last failure timestamps.
+
+  ACTION 4: Block the multi-agent test harness
+    The scheduled test harness flow (Guide 06) should always check the smoke
+    test status before executing the regression suite. Build this check into the
+    harness as a precondition:
+      IF OverallStatus of most recent smoke test run != "OK":
+        ABORT the regression run
+        POST a message to the Teams channel: "Regression suite skipped — smoke test failing."
+
+  P0 RESOLUTION:
+    When the smoke test returns "OK" for 2 consecutive runs after a failure streak:
+      - Reset the consecutive failure counter in Dataverse.
+      - Post a resolution notification to the Teams channel:
+        "[RESOLVED] Copilot Agent Smoke Test — Platform health restored."
+      - Update the incident record in ITSM to "Resolved."
+
+
+SECTION 6: SMOKE TEST TELEMETRY IN APP INSIGHTS
+-------------------------------------------------
+Every smoke test run emits a "SmokeTestRun" custom event to App Insights (defined
+in Flow Step 10 in Section 3.3 above). This enables:
+
+  - Trend charts of smoke test pass rate over time in Power BI (via App Insights
+    data source defined in Guide 04, Section 1.2)
+  - Latency trending for the smoke test itself (a rising smoke test latency can
+    be an early warning of platform degradation before business users notice)
+  - Correlation of smoke test failure timestamps with Azure service health
+    events, Copilot Studio publishing events, or Power Platform maintenance windows
+
+Recommended KQL query for Power BI (add to the App Insights queries in Guide 04):
+  customEvents
+  | where name == "SmokeTestRun"
+  | project
+      timestamp,
+      runId           = tostring(customDimensions["runId"]),
+      overallStatus   = tostring(customDimensions["overallStatus"]),
+      dataverseOK     = tobool(customDimensions["dataverseOK"]),
+      sharePointOK    = tobool(customDimensions["sharePointOK"]),
+      latencyMs       = toint(customDimensions["latencyMs"]),
+      environment     = tostring(customDimensions["agentEnvironment"])
+  | order by timestamp desc
+
+Add a dedicated section on Page 1 of the Power BI dashboard (Guide 04) for
+platform health:
+  - Latest smoke test status (color-coded tile: green / yellow / red)
+  - Smoke test pass rate (last 7 days)
+  - Smoke test latency trend (line chart)
+  - Consecutive failure current count
+
+
+SECTION 7: INTEGRATION WITH MULTI-AGENT TEST HARNESS
+------------------------------------------------------
+The smoke test is the mandatory precondition for the multi-agent regression test
+harness described in Guide 06. The harness must perform this check at the very
+start of every regression run:
+
+  HARNESS PRECONDITION CHECK:
+    Query Dataverse: get the most recent new_smoketestlog record.
+    Check: new_status == "OK" AND new_createdon >= (utcNow - 60 minutes)
+    If check passes: proceed with the regression suite.
+    If check fails: abort the regression run, log the reason, send notification.
+
+The 60-minute freshness window ensures the smoke test is recent enough to be
+relevant. If the smoke test last ran more than 60 minutes ago (suggesting the
+scheduled flow has stopped running), treat this as a failure condition.
+
+ENVIRONMENTS:
+  Run a separate smoke test agent per environment:
+    - Dev environment: smoke test runs every 15 minutes (more flexible)
+    - UAT environment: smoke test runs every 30 minutes
+    - Production environment: smoke test runs every 30 minutes
+
+  Each environment's smoke test agent connects to that environment's Dataverse
+  and SharePoint. This ensures smoke tests are validating the specific environment
+  where the regression suite or production workloads are running.
+
+
+SECTION 8: MAINTENANCE AND LIFECYCLE OF THE SMOKE TEST AGENT
+--------------------------------------------------------------
+Because the smoke test agent is stable and infrequently changed, it has a simpler
+lifecycle than production agents. However, it still requires care.
+
+WHEN TO UPDATE THE SMOKE TEST AGENT:
+  - When a new connector or integration is added to production agents (add a
+    matching check to the smoke test flow within the same sprint).
+  - When the SharePoint file storage library path changes (update STEP 5).
+  - When the Dataverse schema changes the test table structure (update STEP 1-3).
+  - When the Direct Line endpoint changes (update the scheduled cloud flow).
+
+WHAT NOT TO CHANGE IN THE SMOKE TEST AGENT:
+  - Do not add business logic or AI steps to the smoke test agent.
+  - Do not add user-facing topics to the smoke test agent.
+  - Do not change the trigger phrase "run smoke test" without updating the
+    scheduled cloud flow accordingly.
+
+VERSIONING:
+  The smoke test agent solution should be version-controlled separately from the
+  production agent solutions. Increment the version number whenever any component
+  of the smoke test changes. Document changes in a changelog maintained in your
+  source control repository or SharePoint site.
+
+
+NEXT STEPS
+----------
+With the smoke test agent and flow operational:
+  - Integrate the smoke test status check as the gate condition in Guide 06
+    (Multi-Agent Testing Pipeline).
+  - Add the smoke test SmokeTestRun App Insights query to the Guide 04 Power BI
+    data model.
+  - Configure the P0 alert in the "Agent Quality Alerts" Teams channel before
+    going live with the regression pipeline.
+
+================================================================================
+END OF GUIDE 05
+================================================================================

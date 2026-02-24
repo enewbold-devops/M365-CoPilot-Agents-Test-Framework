@@ -1,0 +1,501 @@
+GUIDE 02: POWER AUTOMATE AND AGENT FLOW IMPLEMENTATION
+Microsoft 365 Copilot Studio Agent Framework
+Monitoring, Evaluation, and Testing Platform
+================================================================================
+Date: February 24, 2026
+Version: 1.0
+Audience: Power Platform Maker, Flow Developer, Integration Lead
+================================================================================
+
+
+PURPOSE OF THIS GUIDE
+----------------------
+This guide provides the complete step-by-step implementation for the Copilot Studio
+topic design and the Power Automate Agent Flow that processes file attachments
+submitted through a conversation. The flow handles all deterministic validation,
+parsing, data quality checks, and Dataverse persistence before optionally passing
+data to an AI step. It also emits telemetry to Azure Application Insights for deep
+performance monitoring.
+
+This guide covers:
+  - How to design the Copilot Studio topic to accept file uploads and pass them
+    to a flow
+  - The full Agent Flow step architecture (Gates 1 through 6)
+  - The IsTestMode flag pattern for safe test execution
+  - App Insights custom event emission strategy
+  - Error handling and retry policy
+  - The output contract returned to the user at the end of the conversation
+
+You should complete Guide 01 (Dataverse Schema and Setup) before implementing
+the flows in this guide, because the flows write to the tables defined there.
+
+
+SECTION 1: COPILOT STUDIO TOPIC DESIGN
+---------------------------------------
+The topic is the conversational layer. It collects intent and the file from the
+user, then hands off to the Agent Flow. The topic itself performs no parsing,
+validation, or business logic — that all lives in the flow.
+
+1.1 Topic Name and Trigger
+   Name your topic descriptively, for example: "Process File Upload"
+   Set the trigger phrases to cover likely user expressions:
+     - "I want to upload a file"
+     - "upload spreadsheet"
+     - "submit my data file"
+     - "I have a CSV to import"
+     - "process my file"
+   You can expand this list over time based on analytics from real sessions.
+
+1.2 Node Sequence in the Topic
+   Design the topic with nodes in this order:
+
+   NODE 1: File Question
+     - Add a "Question" node using the File attachment input type.
+     - Prompt text (example):
+       "Please upload your file. I accept CSV, XLSX, and XML formats up to 50 MB."
+     - Store the response in a variable: Topic.UploadedFile
+     - This variable will contain the file metadata (filename, URL, size, type)
+       that Copilot Studio makes available after a user uploads a file.
+
+   NODE 2: Intent Clarification
+     - Add a "Question" node with multiple-choice options.
+     - Prompt text (example):
+       "What would you like to do with this file?"
+     - Options:
+       * Validate and summarize
+       * Import records into the system
+       * Validate and return a cleaned file
+       * Compare with previous submission
+     - Store the response in: Topic.UserIntent
+     - This intent is passed to the flow so it can branch logic accordingly.
+
+   NODE 3: Confirmation Message
+     - Send a message to the user while the flow executes (this sets expectations):
+       "Thank you. I've received your file and I'm processing it now.
+        This typically takes 15–60 seconds depending on file size."
+
+   NODE 4: Call Agent Flow
+     - Add a "Call an action" node — select your Agent Flow (created in Section 2).
+     - Input parameters to pass to the flow:
+         ConversationId   = System.Conversation.Id
+         SessionId        = System.Conversation.Id  (use same for simplicity)
+         UserId           = System.User.Id
+         UserDisplayName  = System.User.DisplayName
+         AgentId          = (hardcode your bot GUID or use a topic-level variable)
+         AgentVersion     = (hardcode your current version string)
+         FileUrl          = Topic.UploadedFile.Url
+         FileName         = Topic.UploadedFile.Name
+         FileSizeBytes    = Topic.UploadedFile.Size
+         FileType         = Topic.UploadedFile.MimeType
+         UserIntent       = Topic.UserIntent
+         IsTestMode       = false   (always false for production topics)
+     - Receive these output variables from the flow:
+         FlowStatus       (Success / PartialSuccess / Failed)
+         TotalRows        (integer)
+         ValidRows        (integer)
+         InvalidRows      (integer)
+         CreatedCount     (integer)
+         UpdatedCount     (integer)
+         ExceptionReportUrl (text, URL)
+         SummaryMessage   (text, formatted for display)
+         BatchUploadId    (GUID of the new_BatchUpload record)
+
+   NODE 5: Branching on FlowStatus
+     - Add condition branches:
+       * If Topic.FlowStatus equals "Success":
+           Show success message using SummaryMessage variable.
+           Offer next steps (download exception report, route, etc.)
+       * If Topic.FlowStatus equals "PartialSuccess":
+           Indicate partial success, show counts, link to exception report.
+       * If Topic.FlowStatus equals "Failed":
+           Explain the failure reason.
+           Offer to retry or escalate to a human agent.
+
+   NODE 6: Structured Output Message
+     - Always return a structured summary regardless of status. Example format:
+       "Processing complete:
+        - Total rows: {TotalRows}
+        - Valid rows: {ValidRows}
+        - Invalid rows: {InvalidRows}
+        - Records created: {CreatedCount}
+        - Records updated: {UpdatedCount}
+        - Exception report: {ExceptionReportUrl}
+        Next steps: Review the exception report for rows that could not be imported."
+
+1.3 Topic-Level Variables to Initialize
+   Initialize these variables at the top of the topic (before Node 1):
+     Topic.UploadedFile    — File type
+     Topic.UserIntent      — Text
+     Topic.FlowStatus      — Text (default: "")
+     Topic.TotalRows       — Number (default: 0)
+     Topic.ValidRows       — Number (default: 0)
+     Topic.InvalidRows     — Number (default: 0)
+
+1.4 Error Handling in the Topic
+   Add an "On Error" branch at the topic level. If the Agent Flow call itself fails
+   (not a business logic failure, but a flow invocation failure), the On Error branch
+   should:
+     - Log the system error message (System.LastErrorMessage) to a Dataverse error
+       log or App Insights via a separate lightweight flow.
+     - Return a user-facing message: "Something went wrong processing your file.
+       Our team has been notified. Please try again or contact support."
+
+
+SECTION 2: AGENT FLOW ARCHITECTURE
+------------------------------------
+Create a Cloud Flow of type "Instant cloud flow — Power Virtual Agents (Copilot Studio)"
+in Power Automate. This is referred to as an Agent Flow. Name it descriptively,
+for example: "AgentFlow-ProcessFileUpload".
+
+The flow accepts the input parameters listed in Section 1.2 (NODE 4) and returns
+the output variables listed there.
+
+All steps below are within this single flow execution.
+
+2.1 GATE 1: File Type and Size Validation
+   This is the first thing the flow does. Fail fast if the file is not acceptable.
+
+   Step: Initialize a variable called ValidationPassed (Boolean, default: true)
+   Step: Initialize a variable called FailureReason (String, default: "")
+
+   Check 1 — File type:
+     Using a Compose or Condition action, extract the file extension from FileName.
+     Accept list: .csv, .xlsx, .xml
+     If the extension is not in the accept list:
+       - Set ValidationPassed = false
+       - Set FailureReason = "Unsupported file type. Only CSV, XLSX, and XML are accepted."
+       - Skip to the Return Output step (early exit).
+
+   Check 2 — File size:
+     If FileSizeBytes > 52428800 (50 MB):
+       - Set ValidationPassed = false
+       - Set FailureReason = "File exceeds the 50 MB size limit."
+       - Skip to the Return Output step.
+
+   Check 3 — Filename sanity:
+     Reject filenames with path traversal characters: "..", "/", "\", ":".
+     If any are present:
+       - Set ValidationPassed = false
+       - Set FailureReason = "Invalid filename."
+       - Skip to the Return Output step.
+
+   Note on malware scanning: If your organization has a malware scanning API or
+   a connector (e.g., Microsoft Defender for Cloud Apps), add a malware scan step
+   here before proceeding to Gate 2. This is optional but strongly recommended
+   for any environment processing externally sourced files.
+
+2.2 GATE 2: Raw File Storage
+   Before parsing, store the raw file in SharePoint/OneDrive. This ensures you
+   always have the original regardless of what happens downstream.
+
+   Step: Use SharePoint — "Create file" action
+     - Site: your designated agent file storage library
+       (e.g., https://<tenant>.sharepoint.com/sites/AgentArtifacts)
+     - Folder path: /RawUploads/{Year}/{Month}/{Day}/{ConversationId}/
+     - File name: FileName
+     - File content: retrieve from the file URL. Use HTTP action with the file URL
+       and the Dataverse or SharePoint connector to download the binary content.
+   Step: Capture the SharePoint file URL from the "Create file" output.
+     Store in variable: StorageUrl
+
+   Step: Create new_BatchUpload record in Dataverse:
+     - new_conversationid: ConversationId
+     - new_sourcefilename: FileName
+     - new_filetype: (map mime type to choice value)
+     - new_filesizebytes: FileSizeBytes
+     - new_storageurl: StorageUrl
+     - new_status: 100000000 (Pending)
+     - new_istestdata: IsTestMode
+     - Lookup bind to agent: bots(<AgentId>)
+   Step: Capture the new BatchUploadId GUID from the Dataverse create response.
+
+2.3 GATE 3: Parse and Normalize
+   Parse the file into a structured row collection. The approach differs by file type.
+
+   For CSV:
+     - Use the "Parse CSV" action or a custom connector / Microsoft Dataflows pattern.
+     - Extract headers from row 1.
+     - Validate that all required columns are present in the header row.
+     - If required columns are missing: set ValidationPassed = false, FailureReason
+       = "Missing required columns: {list}". Skip to Return Output.
+     - Iterate over data rows. For each row, create a JSON object mapping column
+       name to value.
+
+   For XLSX:
+     - Use the Excel connector "List rows present in a table" or "Get rows" action.
+     - Specify the sheet name (your canonical schema defines which sheet is expected).
+     - If the expected sheet does not exist: set ValidationPassed = false,
+       FailureReason = "Expected sheet '{SheetName}' not found in workbook."
+     - Iterate over rows.
+
+   For XML:
+     - Use a Parse JSON action after reading the XML (convert XML to JSON using
+       Power Automate's xml() and json() functions or a custom connector).
+     - Validate that the root node and required child nodes are present.
+     - If schema is invalid: set ValidationPassed = false.
+     - Extract records from the XML node collection.
+
+   After parsing, you have a collection of raw JSON row objects. Store count in
+   variable: TotalRows.
+
+2.4 GATE 4: Row-Level Data Quality Validation
+   For each parsed row:
+     - Check for required field presence (not null, not empty).
+     - Check data types (numeric fields contain numbers, dates parse correctly).
+     - Check uniqueness of the NaturalKey field within this upload batch.
+     - Check any business-specific rules (e.g., Amount must be > 0, Status
+       must be in allowed values list).
+     - Collect all validation errors for the row into a list.
+     - Classify row as Valid or Invalid based on error list.
+     - Write a new_BatchRow record to Dataverse for each row:
+         new_batchuploadid: BatchUploadId
+         new_rownumber: row index
+         new_naturalkey: value of natural key field in this row
+         new_payloadjson: full row as JSON string
+         new_validationstatus: 100000000 (Valid) or 100000001 (Invalid)
+         new_validationerrors: comma-separated error descriptions (if any)
+       Use the PATCH upsert pattern with the alternate key to safely handle retries.
+
+   After the loop:
+     - Count valid rows → ValidRows variable
+     - Count invalid rows → InvalidRows variable
+
+2.5 GATE 5: AI Step (Optional — Only After Deterministic Pass)
+   This step is only executed if ValidationPassed is true AND ValidRows > 0.
+   Never run AI logic before deterministic validation.
+
+   Option A — Summarization:
+     Pass a sample of valid rows to a GPT-based AI Builder prompt or Azure OpenAI
+     connector. The prompt asks for a summary and anomaly highlights.
+     Example prompt: "Review the following records and identify:
+       1) Overall summary
+       2) Any statistical anomalies
+       3) Data quality observations
+       Records: {first 20 valid rows as JSON}"
+
+   Option B — Entity extraction (for PDF/DOCX scenarios):
+     Pass the extracted text to an AI prompt for key entity extraction.
+     Store extracted entities in the BatchUpload record or as a separate output.
+
+   Option C — Classification and routing:
+     Pass summary info to a classifier prompt to determine routing destination.
+     Return routing recommendation as part of SummaryMessage.
+
+   Store AI output in: AISummary variable (string).
+
+   Note: If the AI step fails (timeout, content filter, API error), log the error
+   to App Insights but do not fail the entire flow. The deterministic result is
+   still valid and should be returned to the user. The AI layer is enrichment only.
+
+2.6 GATE 6: Upsert Valid Rows and Generate Exception Report
+   Step: For each valid row, perform the business action:
+     - If UserIntent = "Import records": upsert into target Dataverse table using
+       the alternate key pattern described in Guide 01. Record the outcome
+       (Created / Updated / Skipped / Failed) in the new_BatchRow record by
+       issuing a PATCH to update new_upsertaction.
+     - If UserIntent = "Validate and return file": skip upsert. Proceed to
+       exception report generation.
+
+   Step: Generate exception report:
+     If InvalidRows > 0:
+       - Create a CSV string from the invalid rows with an added column "Errors".
+       - Use SharePoint "Create file" to write the exception report to:
+         /ExceptionReports/{ConversationId}/exceptions_{timestamp}.csv
+       - Capture URL → ExceptionReportUrl variable.
+     If InvalidRows = 0:
+       - ExceptionReportUrl = "" (empty)
+
+   Step: Update new_BatchUpload record:
+     PATCH the BatchUploadId record with final status, counts, and exception URL.
+
+2.7 Write EvalResult (If This Is a Test Run or If Evaluation Is Always On)
+   If IsTestMode = true OR if continuous evaluation is enabled for this agent:
+     - Calculate overallscore using the formula defined in Guide 03.
+     - Create a new_EvalResult record linking to the EvalRun and TestCase
+       (pass these IDs as additional flow inputs when calling from the test harness).
+     - Include: ConversationId, TaskSuccess, GroundingScore (if AI used), latency,
+       TurnsToResolution (pass from the topic via input variable), SafetySeverity.
+
+2.8 Emit App Insights Custom Events
+   Use the HTTP action to POST to your App Insights instrumentation endpoint:
+   Endpoint: https://dc.services.visualstudio.com/v2/track
+   This is the direct ingestion URL. Use a flow action or custom connector.
+   Alternatively, use an Azure Function as a telemetry relay if you need enrichment.
+
+   Emit the following named events:
+
+   EVENT: UploadReceived
+     Properties:
+       conversationId, agentId, agentVersion, channel, fileType,
+       fileSizeBytes, isTestMode, timestamp
+
+   EVENT: ParseCompleted (or ParseFailed if Gate 3 failed)
+     Properties:
+       conversationId, fileType, totalRows, parseSuccess (bool), latencyMs,
+       failureReason (if failed)
+
+   EVENT: ValidationCompleted
+     Properties:
+       conversationId, totalRows, validRows, invalidRows, validationPassRate
+
+   EVENT: UpsertCompleted (if import intent)
+     Properties:
+       conversationId, createdCount, updatedCount, skippedCount, failedCount,
+       upsertCorrectness (float: successfulUpserts / totalValidRows)
+
+   EVENT: FlowCompleted
+     Properties:
+       conversationId, flowStatus, totalLatencyMs, isTestMode, overallScore
+
+   Critical correlation dimension: Always include ConversationId AND AgentVersion
+   in every event. This allows every App Insights query to join to Dataverse
+   records by ConversationId and to slice performance trends by agent version.
+
+2.9 RETURN Output Variables
+   After all gates complete:
+     Return to Copilot Studio topic:
+       FlowStatus:         "Success" / "PartialSuccess" / "Failed"
+       TotalRows:          integer
+       ValidRows:          integer
+       InvalidRows:        integer
+       CreatedCount:       integer
+       UpdatedCount:       integer
+       ExceptionReportUrl: string
+       BatchUploadId:      GUID string
+       SummaryMessage:     Formatted summary string for display in chat
+       AISummary:          AI-generated summary string (empty if AI step skipped)
+
+   SummaryMessage construction example:
+     "Processing complete for '{FileName}':
+      - Rows processed: {TotalRows}
+      - Valid: {ValidRows} | Invalid: {InvalidRows}
+      - Records created: {CreatedCount} | Updated: {UpdatedCount}
+      {if InvalidRows > 0: "- Exception report: {ExceptionReportUrl}"}"
+
+
+SECTION 3: IsTestMode FLAG PATTERN
+------------------------------------
+The IsTestMode Boolean input parameter is fundamental to running the test harness
+safely against production flow logic.
+
+When IsTestMode = true:
+  - Gate 1, Gate 2 (storage), Gate 3, Gate 4: execute as normal. You want to
+    test the real validation logic.
+  - Gate 5 (AI step): execute as normal IF you want to test AI quality. Skip if
+    you want deterministic-only test runs (recommended for regression testing).
+  - Gate 6 (upsert to business tables): SKIP real upserts. Instead, compute what
+    you would have done and log those counts, but write to a dedicated test
+    namespace or simply omit the real upsert.
+  - new_BatchUpload record: set new_istestdata = true. This flags the record for
+    the automated cleanup job (see Guide 06).
+  - new_BatchRow records: set new_istestdata = true (add this column to the table).
+  - new_EvalResult: always write (this is the whole point of test mode).
+  - App Insights events: always emit (so you can verify telemetry pipeline too).
+  - SharePoint file storage: write to a separate test folder:
+    /RawUploads/TestRuns/{RunId}/ instead of /RawUploads/{Year}/...
+
+This design means your test harness exercises 95% of the production code path,
+making test results a reliable signal of production behavior, while preventing
+test data from contaminating real business records.
+
+
+SECTION 4: ERROR HANDLING AND RETRY POLICY
+---------------------------------------------
+Configure the flow with a robust error handling strategy:
+
+Flow-level: Set "Run after" conditions on each Gate block to handle failures
+  gracefully. Use a Scope action to wrap each Gate so failures are catchable.
+
+  Try/Catch pattern using Scopes:
+    - Create a Scope called "Gate3-Parse".
+    - After the Scope, add a condition: "Did Scope 'Gate3-Parse' fail?"
+    - If it failed: log the error to App Insights (FlowCompleted event with
+      flowStatus="Failed"), update BatchUpload record status to Failed,
+      return FlowStatus = "Failed" to the topic.
+
+Retry policy for Dataverse connector:
+  Dataverse actions in Power Automate support built-in retry. Set:
+    Retry policy: Exponential interval
+    Retry count: 3
+    Retry interval: PT5S (5 seconds)
+    Maximum interval: PT1M (1 minute)
+  This handles transient Dataverse throttling (HTTP 429) automatically.
+
+Timeout for the whole flow:
+  Agent Flows invoked from Copilot Studio topics have a maximum response window
+  (typically 30–60 seconds before the topic times out). For large files:
+    - Use async patterns: start processing, return immediately with a "Processing
+      started" message, then push the result back via a proactive notification
+      or a "Check my status" topic.
+    - Track BatchUploadId so the user can query status later.
+    - Set a hard flow timeout of 240 seconds at the flow level, with a fallback
+      return to the topic that includes a status URL.
+
+
+SECTION 5: TESTING THE FLOW IN ISOLATION
+------------------------------------------
+Before connecting the flow to a Copilot Studio topic, test it independently
+using the "Test flow" feature in Power Automate with these manual inputs:
+
+Test Case 1 — Valid CSV:
+  IsTestMode=true, FileName="test_valid.csv", FileType=text/csv,
+  FileSizeBytes=204800, UserIntent="Import records"
+  Expected: FlowStatus=Success, ValidRows>0, InvalidRows=0
+
+Test Case 2 — Unsupported file type:
+  IsTestMode=true, FileName="document.docx", FileType=application/msword
+  Expected: FlowStatus=Failed, FailureReason contains "Unsupported file type"
+
+Test Case 3 — CSV with missing required columns:
+  IsTestMode=true, use a test CSV missing the "NaturalKey" column
+  Expected: FlowStatus=Failed, FailureReason contains "Missing required columns"
+
+Test Case 4 — CSV with mixed valid/invalid rows:
+  IsTestMode=true, use a test CSV with 10 valid rows and 3 rows with type errors
+  Expected: FlowStatus=PartialSuccess, ValidRows=10, InvalidRows=3,
+             ExceptionReportUrl is populated
+
+Test Case 5 — Large file near limit:
+  IsTestMode=true, FileSizeBytes=51000000 (> 50 MB limit)
+  Expected: FlowStatus=Failed, FailureReason contains "size limit"
+
+
+SECTION 6: CONNECTING THE FLOW TO ADDITIONAL SCENARIOS
+---------------------------------------------------------
+The same Agent Flow can serve multiple attachment scenarios by branching on UserIntent:
+
+Scenario A: Upload PDF → Summarize → Create ticket
+  Branch on FileType = "pdf" and UserIntent = "Validate and summarize"
+  Skip Gate 3 CSV/XLSX parsing. Instead: extract text from PDF using
+  AI Builder Document Processing or a custom connector.
+  Run Gate 5 (AI) for entity extraction. Skip Gate 6 upsert, instead create CRM ticket.
+
+Scenario B: Upload RFP → Generate response outline
+  Branch on UserIntent = "Generate response"
+  Gate 5 uses a specialized prompt for RFP section extraction and compliance matrix.
+  Output is a structured outline written to SharePoint.
+
+Scenario C: Upload evidence → Classify and route
+  Branch on UserIntent = "Route for review"
+  Gate 5 classifies document type and routing destination.
+  Gate 6 creates a routing queue item rather than a Dataverse upsert.
+
+Scenario D: Compare against prior upload
+  Branch on UserIntent = "Compare with previous submission"
+  After Gate 4, retrieve the most recent prior BatchUpload record for the same agent
+  and user. Compute diff (added rows, removed rows, changed rows). Return diff summary.
+
+
+NEXT STEPS
+----------
+With the topic and Agent Flow implemented:
+  - Proceed to Guide 03 to understand how the scores in new_EvalResult are computed
+    and how the Safety Gate is applied.
+  - Proceed to Guide 05 to build the smoke test agent and flow that validates the
+    full platform stack before running production or regression tests.
+  - Review Guide 06 to see how the IsTestMode pattern integrates with the
+    multi-agent test harness.
+
+================================================================================
+END OF GUIDE 02
+================================================================================

@@ -1,0 +1,538 @@
+GUIDE 04: POWER BI MONITORING DASHBOARD
+Microsoft 365 Copilot Studio Agent Framework
+Monitoring, Evaluation, and Testing Platform
+================================================================================
+Date: February 24, 2026
+Version: 1.0
+Audience: BI Developer, Solution Architect, Operations Lead, Executive Stakeholders
+================================================================================
+
+
+PURPOSE OF THIS GUIDE
+----------------------
+This guide provides the complete design and implementation specification for the
+Power BI monitoring dashboard that serves as the "single pane of glass" for the
+M365 Copilot Studio agent evaluation framework. The dashboard surfaces the scoring,
+KPI trending, regression detection, and operational health data stored in Dataverse
+and Azure Application Insights.
+
+This guide assumes Guide 01 (Dataverse schema) and Guide 03 (scoring framework)
+have been implemented. The data model, measures, and page designs described here
+are directly derived from the tables and KPIs defined in those guides.
+
+
+SECTION 1: DATA SOURCE SETUP
+------------------------------
+The dashboard connects to two primary data sources: Dataverse (for evaluation and
+business outcome data) and Azure Application Insights (for latency and telemetry data).
+A third optional source is Microsoft Purview audit log exports for governance correlation.
+
+1.1 Dataverse Connector Setup
+
+  In Power BI Desktop:
+    1. Select Get Data → Dataverse.
+    2. Enter your environment URL:
+       https://<your-org>.crm.dynamics.com
+    3. Authenticate using your organizational account (the account must have at
+       minimum the Read privileges defined in the security role in Guide 01, Step 5).
+    4. Select the following tables from the Dataverse connection:
+         - new_evalruns
+         - new_evalresults
+         - new_evalartifacts
+         - new_batchuploads
+         - new_batchrows
+         - new_testcases
+         - new_agenttestconfigs
+         - bots (the native Copilot Studio agent table)
+         - conversationtranscripts (if transcript access is enabled)
+
+  Import vs DirectQuery:
+    For environments with moderate data volumes (fewer than 500,000 EvalResult
+    records), use Import mode with a scheduled refresh (hourly or every 30 minutes).
+    This provides the best performance for dashboard users.
+
+    For high-volume environments or when near-real-time monitoring is required
+    on production sessions, use DirectQuery. Note: DirectQuery has limitations
+    on complex DAX measures. Some calculated columns must be computed in Power
+    Query or via Dataverse calculated fields instead.
+
+    Recommended initial approach: Import mode with 30-minute refresh for the
+    evaluation tables, plus a separate DirectQuery connection to a specific
+    EvalRun summary view for real-time status.
+
+1.2 Azure Application Insights Data Source
+
+  In Power BI Desktop:
+    1. Select Get Data → More → Azure → Azure Application Insights.
+    2. Authenticate with your Azure account.
+    3. Select your Application Insights resource.
+    4. Use Kusto (KQL) queries to pull specific custom events:
+
+    QUERY: FlowCompleted events (for latency and overall status)
+      customEvents
+      | where name == "FlowCompleted"
+      | project
+          timestamp,
+          conversationId   = tostring(customDimensions["conversationId"]),
+          agentId          = tostring(customDimensions["agentId"]),
+          agentVersion     = tostring(customDimensions["agentVersion"]),
+          channel          = tostring(customDimensions["channel"]),
+          flowStatus       = tostring(customDimensions["flowStatus"]),
+          totalLatencyMs   = toint(customDimensions["totalLatencyMs"]),
+          isTestMode       = tobool(customDimensions["isTestMode"]),
+          overallScore     = todouble(customDimensions["overallScore"])
+      | where isTestMode == false
+
+    QUERY: ValidationCompleted events (for parse/validation metrics)
+      customEvents
+      | where name == "ValidationCompleted"
+      | project
+          timestamp,
+          conversationId   = tostring(customDimensions["conversationId"]),
+          totalRows        = toint(customDimensions["totalRows"]),
+          validRows        = toint(customDimensions["validRows"]),
+          invalidRows      = toint(customDimensions["invalidRows"]),
+          validationPassRate = todouble(customDimensions["validationPassRate"])
+
+    QUERY: P95 latency by agent and channel (pre-aggregated for performance)
+      customEvents
+      | where name == "FlowCompleted" and tobool(customDimensions["isTestMode"]) == false
+      | summarize
+          P50Latency  = percentile(toint(customDimensions["totalLatencyMs"]), 50),
+          P95Latency  = percentile(toint(customDimensions["totalLatencyMs"]), 95),
+          AvgLatency  = avg(toint(customDimensions["totalLatencyMs"])),
+          EventCount  = count()
+        by
+          AgentId   = tostring(customDimensions["agentId"]),
+          Channel   = tostring(customDimensions["channel"]),
+          bin(timestamp, 1d)
+
+  Store these App Insights query results as separate Power BI query tables:
+    AppInsights_FlowCompleted, AppInsights_ValidationCompleted, AppInsights_LatencyByDay
+
+1.3 Relationship Model (Power BI Data Model)
+
+  After loading the tables, define these relationships in the Power BI data model:
+
+  new_evalresults → new_evalruns
+    Many-to-one on new_evalresultid.new_evalrunid
+
+  new_evalresults → new_testcases
+    Many-to-one on new_evalresultid.new_testcaseid
+
+  new_evalruns → bots
+    Many-to-one on new_evalruns._new_agentid_value = bots.botid
+
+  new_batchuploads → bots
+    Many-to-one on new_batchuploads._new_agentid_value = bots.botid
+
+  new_batchrows → new_batchuploads
+    Many-to-one on new_batchrows._new_batchuploadid_value
+
+  new_evalartifacts → new_evalresults
+    Many-to-one on new_evalartifacts._new_evalresultid_value
+
+  AppInsights_FlowCompleted → new_evalresults
+    Link on conversationId (both tables). This is the cross-source join.
+    Note: Power BI cross-source joins require both tables to be in Import mode
+    or both in DirectQuery. If you mix modes, you will need to duplicate the
+    conversationId as a common bridge key.
+
+  DimDate (create a date dimension table):
+    Use Power Query M to generate a contiguous date table from
+    2026-01-01 to today + 365 days.
+    Mark it as a Date Table.
+    Connect to new_evalruns.new_startedon and new_batchuploads.new_createdon.
+
+
+SECTION 2: DAX MEASURES
+-------------------------
+Create all measures in a dedicated Measure Table (create an empty calculated table
+named "Measures" and store all measures there to keep the model clean).
+
+---------------------------------------------------------------------------
+MEASURE: AvgAgentScore
+  AvgAgentScore =
+    AVERAGEX(
+      FILTER(new_evalresults, NOT ISBLANK(new_evalresults[new_overallscore])),
+      new_evalresults[new_overallscore]
+    )
+
+---------------------------------------------------------------------------
+MEASURE: PassRate
+  PassRate =
+    DIVIDE(
+      COUNTROWS(FILTER(new_evalresults, new_evalresults[new_overallscore] >= 80)),
+      COUNTROWS(FILTER(new_evalresults, NOT ISBLANK(new_evalresults[new_overallscore]))),
+      0
+    )
+  Note: Adjust the 80-point passing threshold to match your team's decision.
+  This threshold should align with new_AgentTestConfig.new_scoredroptreshold.
+
+---------------------------------------------------------------------------
+MEASURE: TaskSuccessRate
+  TaskSuccessRate =
+    DIVIDE(
+      COUNTROWS(FILTER(new_evalresults, new_evalresults[new_tasksuccess] = true)),
+      COUNTROWS(new_evalresults),
+      0
+    )
+
+---------------------------------------------------------------------------
+MEASURE: HardFailCount
+  HardFailCount =
+    COUNTROWS(FILTER(new_evalresults, new_evalresults[new_ishardfail] = true))
+
+---------------------------------------------------------------------------
+MEASURE: AvgGroundingScore
+  AvgGroundingScore =
+    AVERAGEX(
+      FILTER(new_evalresults, new_evalresults[new_groundingscore] > 0),
+      new_evalresults[new_groundingscore]
+    )
+
+---------------------------------------------------------------------------
+MEASURE: AvgToolCorrectness
+  AvgToolCorrectness =
+    AVERAGEX(
+      FILTER(new_evalresults, NOT ISBLANK(new_evalresults[new_toolcorrectness])),
+      new_evalresults[new_toolcorrectness]
+    )
+
+---------------------------------------------------------------------------
+MEASURE: AvgUpsertCorrectness
+  NOTE: This is typically tracked at the BUR (batchupload row) level. But
+  for the summary tile on the scorecard, compute as follows:
+  AvgUpsertCorrectness =
+    AVERAGEX(
+      FILTER(new_evalresults, NOT ISBLANK(new_evalresults[new_toolcorrectness])),
+      new_evalresults[new_toolcorrectness]
+    )
+  Replace with a more specific measure once UpsertCorrectness is stored as a
+  dedicated column in new_EvalResult (recommended: add new_upsertscore column).
+
+---------------------------------------------------------------------------
+MEASURE: P95LatencyMs
+  P95LatencyMs =
+    PERCENTILEXINC(new_evalresults, new_evalresults[new_latencyms], 0.95)
+  Note: PERCENTILEXINC is the DAX equivalent of a 95th percentile.
+
+---------------------------------------------------------------------------
+MEASURE: ScoreDeltaVsBaseline
+  ScoreDeltaVsBaseline =
+    -- Returns the scoredelta column from the most recent EvalRun for the current filter
+    CALCULATE(
+      FIRSTNONBLANKVALUE(new_evalruns[new_scoredelta], new_evalruns[new_scoredelta]),
+      TOPN(1, new_evalruns, new_evalruns[new_startedon], DESC)
+    )
+
+---------------------------------------------------------------------------
+MEASURE: ValidationPassRate
+  ValidationPassRate =
+    DIVIDE(
+      SUM(new_batchuploads[new_validrowcount]),
+      SUM(new_batchuploads[new_rowcount]),
+      0
+    )
+
+---------------------------------------------------------------------------
+MEASURE: UpsertSuccessRate
+  UpsertSuccessRate =
+    DIVIDE(
+      COUNTROWS(FILTER(new_batchrows,
+        new_batchrows[new_upsertaction] = 100000000 ||
+        new_batchrows[new_upsertaction] = 100000001)),
+      COUNTROWS(FILTER(new_batchrows,
+        new_batchrows[new_validationstatus] = 100000000)),
+      0
+    )
+  (Counts Created + Updated over total Valid Rows)
+
+---------------------------------------------------------------------------
+MEASURE: AvgFileSizeMB
+  AvgFileSizeMB =
+    DIVIDE(AVERAGE(new_batchuploads[new_filesizebytes]), 1048576, 0)
+
+---------------------------------------------------------------------------
+MEASURE: TopFailureReason (for display, use a summary table instead)
+  Use a column chart of FailureReason choice values grouped and counted.
+  No DAX measure needed — use a visual with new_failurereason as Axis and
+  COUNTROWS as the value.
+
+
+SECTION 3: DASHBOARD PAGE LAYOUT
+----------------------------------
+Design the dashboard with 5 report pages. Each page targets a different audience
+and use case.
+
+---------------------------------------------------------------------------
+PAGE 1: AGENT SCORECARD (Executive / Operations view)
+  Purpose: At-a-glance summary of all active agents' current quality status.
+  Audience: Leadership, QA lead, operations manager.
+  Refresh: Hourly.
+
+  Slicers (top of page):
+    - Date range (last 7 days / last 30 days / custom)
+    - Channel (All / Web / Teams / D365)
+    - Agent Name (multi-select from bots table)
+    - Test set (All / Golden / Production / Regression)
+
+  Visuals:
+    Row 1 — Summary KPI Cards (large font, color-coded):
+      - AvgAgentScore (green if >= 85, yellow if 70-84, red if < 70)
+      - TaskSuccessRate (% format)
+      - HardFailCount (red if > 0, else green)
+      - P95LatencyMs vs SLO (green/yellow/red vs SLO from AgentTestConfig)
+      - ValidationPassRate (%)
+
+    Row 2 — Agent Comparison Table:
+      Columns: Agent Name | Current Score | Baseline Score | Score Delta |
+               Pass Rate | Hard Fails | P95 Latency | Status
+      Conditional formatting: red highlight on any row with HardFailCount > 0
+      or ScoreDelta below threshold.
+      Sort by: Current Score ascending (worst at top for action focus).
+
+    Row 3 — Score Trend Sparklines (one per agent):
+      Small line chart per agent showing AvgAgentScore over the last 30 days.
+      These give a quick sense of trajectory without needing to navigate elsewhere.
+
+---------------------------------------------------------------------------
+PAGE 2: TREND ANALYSIS (QA / Engineering view)
+  Purpose: Deep KPI trending over time to spot gradual degradation.
+  Audience: QA engineers, flow developers, maker teams.
+  Refresh: Daily.
+
+  Slicers:
+    - Agent Name
+    - Date range
+    - Trigger type (Scheduled / Manual / Pipeline / Production)
+
+  Visuals:
+    Chart 1 — AvgAgentScore by week (line chart with baseline reference line)
+      Add a constant reference line at the baseline score value.
+      Add a shaded zone for the acceptable range (baseline minus threshold).
+
+    Chart 2 — KPI trend lines (multi-line chart):
+      Lines for: TaskSuccessRate, AvgGroundingScore, AvgToolCorrectness,
+                 AvgUpsertCorrectness
+      Date axis: weekly aggregation
+
+    Chart 3 — P50 and P95 Latency trend (dual line chart):
+      Show both latency percentiles over time.
+      Add a red reference line at the SLO (from AgentTestConfig).
+
+    Chart 4 — Pass Rate trend with regression events overlaid:
+      Line chart of PassRate over time.
+      Add a scatter overlay showing EvalRun events (dots on the date axis)
+      colored by Status (green = Passed, red = Failed).
+
+    Chart 5 — Per-KPI heatmap (matrix visual):
+      Rows: KPI name (TaskSuccess, Grounding, ToolCorrectness, etc.)
+      Columns: Week
+      Values: average score per KPI per week
+      Color scale: green to red
+
+---------------------------------------------------------------------------
+PAGE 3: FAILURE PARETO ANALYSIS (Root Cause view)
+  Purpose: Identify the most common failure modes and prioritize fixes.
+  Audience: QA engineers, flow developers.
+  Refresh: Daily.
+
+  Slicers:
+    - Agent Name
+    - Date range
+    - Is Hard Fail (Yes / No)
+
+  Visuals:
+    Chart 1 — Pareto chart of FailureReason:
+      Bar chart of failure count per FailureReason choice, sorted descending.
+      Add a cumulative line for the Pareto 80/20 visual.
+      This immediately shows whether the top 1-2 failure reasons account for
+      most failures.
+
+    Chart 2 — Failure trend over time per reason:
+      Stacked bar chart, one bar per week, stacked by FailureReason.
+      This shows whether certain failure types are appearing or disappearing.
+
+    Chart 3 — Top failing TestCases (table):
+      Columns: TestCase Name | Agent | Failure Reason | Fail Count | Last Failure Date
+      Sorted by Fail Count descending.
+      This pinpoints which specific test scenarios are repeatedly failing.
+
+    Chart 4 — Hard Fail timeline:
+      Scatter plot with date on X axis.
+      Each dot represents a HardFail event.
+      Tooltip shows: Agent, TestCase, FailureReason, ConversationId.
+      Size of dot = severity.
+
+---------------------------------------------------------------------------
+PAGE 4: ATTACHMENT FLOW DETAIL (File Processing view)
+  Purpose: Monitor the health of file upload flows specifically.
+  Audience: Flow developers, data quality owners.
+  Refresh: Every 30 minutes.
+
+  Slicers:
+    - Agent Name
+    - Date range
+    - File type (CSV / XLSX / XML)
+    - Is Test Data (Yes / No)
+
+  Visuals:
+    Row 1 — KPI Cards:
+      - Total uploads (count of new_BatchUpload records)
+      - ValidationPassRate (%)
+      - UpsertSuccessRate (%)
+      - AvgFileSizeMB
+      - Exception report generated rate (% of uploads with exception report URL)
+
+    Chart 1 — Upload volume by day and file type (stacked bar chart)
+
+    Chart 2 — Validation pass rate by file type (clustered bar)
+      Quickly shows if CSV vs XLSX vs XML has different quality levels.
+
+    Chart 3 — Top validation error reasons (bar chart using new_validationerrors
+      field — requires text extraction/parsing Power Query step)
+
+    Chart 4 — Processing latency distribution (histogram):
+      Using new_evalresults.new_latencyms for file upload scenarios.
+      Show P50, P95 reference lines.
+
+    Chart 5 — Upsert action distribution (donut chart):
+      Created / Updated / Skipped / Failed ratio from new_BatchRow records.
+      A high Skipped rate may indicate duplicate submission patterns worth investigating.
+
+    Table — Recent failed uploads:
+      Columns: Upload Date | Agent | Filename | File Type | Error Summary | Status
+      Filters to Status = Failed.
+      Enables quick drill-down into problem uploads.
+
+---------------------------------------------------------------------------
+PAGE 5: DEPLOYMENT REGRESSION GATE (CI/CD / Release view)
+  Purpose: Show the status of the pre-deployment test suite for each agent
+  awaiting release. Acts as a visual gate review before production deployment.
+  Audience: Release manager, solution architect, QA lead.
+  Refresh: On demand (triggered by test pipeline completion).
+
+  Slicers:
+    - Agent Name
+    - EvalRun name (filter to a specific run)
+
+  Visuals:
+    Row 1 — Status Banner:
+      Large conditional card:
+        GREEN: "DEPLOYMENT APPROVED — All quality gates passed."
+        RED:   "DEPLOYMENT BLOCKED — See failure details below."
+      Condition: HardFailCount = 0 AND ScoreDelta >= -Threshold AND
+                 P95LatencyMs <= SLO
+
+    Row 2 — Gate Results Table:
+      Columns: Gate Name | Threshold | Actual Value | Status (PASS / FAIL)
+      Rows:
+        Hard Fail Count        | 0            | HardFailCount
+        Task Success Rate      | >= 95%       | TaskSuccessRate
+        Validation Pass Rate   | >= 99%       | ValidationPassRate
+        Upsert Correctness     | >= 99.5%     | UpsertSuccessRate
+        P95 Latency            | <= SLO ms    | P95LatencyMs
+        Score Delta vs Baseline| >= -5 pts    | ScoreDeltaVsBaseline
+        Previously Passing Test| 0 regressions| (computed via DAX join to baseline)
+
+    Chart 1 — Test case results matrix (test name vs pass/fail):
+      Rows: TestCase Name
+      Columns: Status (PASS / FAIL)
+      Color: green for pass, red for fail
+      This lets the reviewer see exactly which cases passed and which failed.
+
+    Chart 2 — Score comparison: new run vs baseline (bar chart):
+      Two bars per KPI: one for baseline, one for new run.
+      Immediately shows regression direction per KPI.
+
+
+SECTION 4: ROW-LEVEL SECURITY
+--------------------------------
+Configure Row-Level Security (RLS) to restrict dashboard access by team or agent ownership.
+
+  RLS Role: "Agent Team Member"
+    Filter: bots[owningteam] == USERPRINCIPALNAME() (map user to their team)
+    This restricts the EvalRun and EvalResult tables by filtering through the
+    bots relationship, so users only see evaluations for agents their team owns.
+
+  RLS Role: "Global Viewer"
+    No filter — sees all agents. Assign to QA leads and operations.
+
+  RLS Role: "Executive Summary"
+    Filter to aggregated data only. Disable page navigation to Failure Pareto
+    and Attachment Detail pages.
+
+Publish the Power BI report to a dedicated Power BI workspace. Apply RLS roles
+after publishing via the dataset security settings in Power BI Service.
+
+
+SECTION 5: DATA ALERTS AND NOTIFICATIONS
+------------------------------------------
+Configure Power BI Data Alerts for the most critical KPIs. Data Alerts trigger
+when a threshold is crossed on a KPI card or gauge visual.
+
+  ALERT 1: Hard Fail Detected
+    Visual: HardFailCount KPI card on Page 1
+    Condition: Value > 0
+    Notification: Email to QA lead + Teams channel post
+    Action: This is a P0 alert. See Guide 05 for P0 response process.
+
+  ALERT 2: Score below passing threshold
+    Visual: AvgAgentScore KPI card
+    Condition: Value < 80 (adjust to your threshold)
+    Notification: Email to QA lead
+
+  ALERT 3: P95 Latency exceeds SLO
+    Visual: P95LatencyMs KPI card (filtered to production sessions)
+    Condition: Value > SLO_value (parameterize from AgentTestConfig)
+    Notification: Email to flow developer team
+
+  ALERT 4: Regression detected (score delta below threshold)
+    Visual: ScoreDeltaVsBaseline card on Page 5
+    Condition: Value < -5 (adjust to threshold)
+    Notification: Email to release manager + block Teams Power Automate notification
+
+  For Teams integration: Use a Power Automate cloud flow triggered by a Power BI
+  Data Alert to post a formatted adaptive card to a "Agent Quality Alerts" Teams channel.
+  The card should include: Agent name, KPI affected, current value, threshold,
+  link to the Power BI report page, and a direct link to the EvalRun record in Dataverse.
+
+
+SECTION 6: REFRESH SCHEDULE AND GATEWAY SETUP
+-----------------------------------------------
+For the Dataverse connector in Import mode, configure a scheduled refresh:
+  - Frequency: Every 30 minutes (Dataverse import refresh supports this).
+  - Configure a Power BI On-Premises Data Gateway or use the cloud-native
+    Dataverse connector (no gateway required for cloud-to-cloud).
+  - For App Insights connector: no gateway needed. Authenticate via organizational
+    account in Power BI Service.
+
+For the App Insights KQL queries, note that results are queried by Power BI at
+refresh time. Results depend on the retention period configured in your App Insights
+resource (default: 90 days). For longer trends, export App Insights data to
+Azure Monitor Logs or Azure Storage and query from there.
+
+Set the dataset to refresh at:
+  - 06:00 AM (before business hours — morning status check)
+  - 12:00 PM (midday operational check)
+  - 06:00 PM (end-of-day summary)
+  - 02:00 AM (results of overnight regression suite run — see Guide 06)
+
+Add the scheduled test pipeline completion as a trigger for an additional
+on-demand refresh using the Power BI REST API (POST /datasets/{datasetId}/refreshes)
+called from the test harness flow at the end of each regression run.
+
+
+NEXT STEPS
+----------
+With the Power BI dashboard implemented:
+  - Connect the smoke test agent (Guide 05) alert to the Power BI P0 alert pathway.
+  - Connect the CI/CD gate result (Guide 06) to the Page 5 deployment gate view.
+  - Schedule regular stakeholder reviews of the scorecard (recommended: weekly).
+  - Tune alert thresholds based on the first 30 days of production data per the
+    calibration guidance in Guide 03 Section 9.
+
+================================================================================
+END OF GUIDE 04
+================================================================================

@@ -1,0 +1,434 @@
+Microsoft 365 Copilot + Copilot Studio Agents: Monitoring, Evaluations, Attachments — Technical Reference Edition
+=============================================================================================================
+
+Date: February 24, 2026 (America/New_York)
+
+This is an expanded, technical version of the prior narrative export. It includes:
+- Concrete Dataverse Web API endpoint patterns
+- Recommended table/query methodology for Copilot Studio monitoring & evaluations
+- A practical telemetry + evaluation data pipeline design across Web chat, Teams, and Dynamics 365 channels
+
+NOTE ON TABLE NAMES
+-------------------
+Copilot Studio and Power Platform features can light up different Dataverse tables depending on:
+- channel (web, Teams, Dynamics 365)
+- environment type (Dataverse vs Dataverse for Teams)
+- transcript settings and tenant governance
+- feature/version rollouts
+
+Therefore, you should:
+1) discover the exact table names in your environment using the Dataverse metadata endpoints (examples included)
+2) then implement your queries using those discovered schema names.
+
+================================================================================
+0) Quick architecture summary (what to standardize)
+================================================================================
+
+You will get the most reliable monitoring + evaluation coverage by standardizing on:
+
+A) Dataverse Web API (OData v4)
+- KPI warehouse
+- evaluation outputs (your own scoring tables)
+- joins to business outcomes (cases, imports, tickets)
+- some transcript/session analytics (where enabled)
+
+B) Azure Application Insights (AI)
+- deep telemetry: latency, failures, dependency calls, node/tool timing, custom events
+
+C) Microsoft Purview audit logs
+- governance: who changed/published what, compliance/audit evidence
+
+================================================================================
+1) Dataverse Web API fundamentals (auth, endpoints, headers)
+================================================================================
+
+Base URL pattern
+----------------
+https://<org>.crm.dynamics.com/api/data/v9.2/
+
+Common headers
+--------------
+Authorization: Bearer <access_token>
+Accept: application/json
+OData-MaxVersion: 4.0
+OData-Version: 4.0
+Content-Type: application/json; charset=utf-8
+Prefer: odata.include-annotations="*"
+Prefer: odata.maxpagesize=500
+
+Auth (typical)
+--------------
+Use Microsoft Entra ID (Azure AD) OAuth2 to get an access token for Dataverse.
+
+Resource / scope commonly used:
+- For v2 endpoints: scope = "https://<org>.crm.dynamics.com/.default"
+- Token obtained via client credentials (service principal) or delegated user auth
+
+================================================================================
+2) Dataverse schema discovery methodology (do this first)
+================================================================================
+
+You should NOT guess table/column names. Discover them programmatically.
+
+A) List entity definitions (tables)
+-----------------------------------
+GET EntityDefinitions?$select=LogicalName,SchemaName,DisplayName
+
+Example:
+GET https://<org>.crm.dynamics.com/api/data/v9.2/EntityDefinitions?$select=LogicalName,SchemaName
+
+B) Find likely transcript/session tables
+----------------------------------------
+Strategy:
+1) search for entities with names containing “transcript”, “conversation”, “session”, “bot”
+2) then query EntityDefinitions for those matches
+
+Examples:
+GET EntityDefinitions?$select=LogicalName,SchemaName&$filter=contains(LogicalName,'transcript')
+GET EntityDefinitions?$select=LogicalName,SchemaName&$filter=contains(LogicalName,'conversation')
+GET EntityDefinitions?$select=LogicalName,SchemaName&$filter=contains(LogicalName,'bot')
+GET EntityDefinitions?$select=LogicalName,SchemaName&$filter=contains(SchemaName,'Bot')
+
+C) Inspect columns for a discovered table
+-----------------------------------------
+GET EntityDefinitions(LogicalName='<logicalname>')/Attributes?$select=LogicalName,AttributeType
+
+Example:
+GET https://<org>.crm.dynamics.com/api/data/v9.2/EntityDefinitions(LogicalName='conversationtranscripts')/Attributes?$select=LogicalName,AttributeType
+
+D) Confirm primary key and key fields
+-------------------------------------
+GET EntityDefinitions(LogicalName='<logicalname>')?$select=PrimaryIdAttribute,PrimaryNameAttribute
+
+================================================================================
+3) Agent definition endpoints (Copilot Studio “what is deployed”)
+================================================================================
+
+Copilot Studio agent definitions live in Dataverse. You will typically see:
+- bot (agent)
+- botcomponent (topics/nodes/components)
+- supporting tables for versions, environment, publishing history (varies)
+
+Examples (logical names may differ; discover via metadata)
+---------------------------------------------------------
+A) List agents (bots)
+GET /bots?$select=botid,name,createdon,modifiedon,statecode,statuscode
+
+B) List components
+GET /botcomponents?$select=botcomponentid,name,componenttype,createdon,modifiedon
+
+C) Filter to a specific agent by ID
+GET /bots(<bot-guid>)?$select=botid,name
+
+D) Join components to a bot (relationship names vary)
+- Use $expand once you discover navigation properties
+Example pattern:
+GET /bots(<bot-guid>)?$select=botid,name&$expand=bot_botcomponents($select=botcomponentid,name,componenttype)
+
+================================================================================
+4) Transcript/session data endpoints (Copilot Studio “what happened”)
+================================================================================
+
+The most robust strategy is:
+
+1) Enable transcripts where policy allows
+2) Use metadata discovery to identify:
+   - the transcript table(s)
+   - the session table(s)
+   - any analytics rollup tables (topic outcomes, feedback)
+3) Build your own evaluation tables and join to session/transcript IDs
+
+Commonly referenced table names (confirm in your org)
+-----------------------------------------------------
+- conversationtranscripts (ConversationTranscript)
+- msdyn_botsessions (Bot sessions) — name varies by environment
+- feedback tables (thumbs up/down) — varies
+
+A) Query transcripts (example pattern)
+--------------------------------------
+GET /conversationtranscripts?$select=conversationtranscriptid,createdon,modifiedon,channel,conversationid,transcript
+&$filter=createdon ge 2026-02-24T00:00:00Z
+
+B) Query sessions (example pattern)
+-----------------------------------
+GET /msdyn_botsessions?$select=msdyn_botsessionid,createdon,channel,botid,conversationid,outcome,statuscode
+
+C) Pagination
+-------------
+Dataverse returns @odata.nextLink when results exceed page size.
+Follow the nextLink until complete.
+
+D) Incremental loads (delta approach)
+-------------------------------------
+Preferred: filter by modifiedon.
+Example:
+GET /conversationtranscripts?$select=conversationtranscriptid,modifiedon,conversationid
+&$filter=modifiedon ge 2026-02-24T00:00:00Z
+
+For high-volume: persist last watermark (max modifiedon) and query forward.
+
+E) Full-text / structured transcript fields
+-------------------------------------------
+Transcripts may store JSON blobs. Your pipeline should:
+- store raw transcript JSON as-is
+- extract normalized fields in your own tables (see Section 6)
+
+================================================================================
+5) Channel-specific monitoring notes (Web chat, Teams, Dynamics 365)
+================================================================================
+
+A) Web chat
+-----------
+- Typically easiest for transcript + session extraction via Dataverse.
+- Use Dataverse as your “analytics truth” + App Insights for telemetry.
+
+B) Teams
+--------
+- The Teams app UX can differ from the web app for transcript access.
+- Standardize extraction from Dataverse + telemetry from App Insights.
+- If you use Dataverse for Teams environments, quotas/constraints differ: validate environment type and capacity.
+
+C) Dynamics 365
+---------------
+- Best place to correlate agent sessions with business outcomes:
+  - case created, routed, resolved, SLA met
+- Standardize correlation IDs:
+  - store session/conversation IDs on case records
+  - store agent version and channel on the business record
+
+================================================================================
+6) Evaluation methodology (golden set, scoring rubric, storage schema)
+================================================================================
+
+You asked specifically about “monitoring agents and evaluations.” The key methodology is:
+
+1) Operational analytics: what happened (sessions, success, fallbacks, latency)
+2) Evaluations: how good it was (grounding, correctness, safety, tool quality)
+
+A) Golden test sets (regression evaluation)
+------------------------------------------
+- Create a curated dataset of prompts/intents (sanitized)
+- For file upload scenarios, include representative sample files:
+  - CSV with missing columns
+  - XLSX with multiple sheets
+  - XML with invalid nodes
+- Store expected outcomes:
+  - expected extracted entities
+  - expected validation errors
+  - expected workflow actions (create/update counts)
+
+B) Evaluation rubric (suggested)
+--------------------------------
+Compute metrics per session/run:
+- TaskSuccess (0/1)
+- GroundingScore (0–1) (if using RAG or knowledge sources)
+- ToolCorrectness (0–1) (right tool, right params, right order)
+- LatencyMs (numeric)
+- TurnsToResolution (numeric)
+- SafetyFlags (categorical or bitmask)
+- UserFeedback (thumbs up/down + text)
+
+Apply Safety Gate:
+- If high-severity safety flag: FAIL, regardless of score
+
+C) Store evaluation results in Dataverse (your own tables)
+---------------------------------------------------------
+Create custom tables to avoid depending on channel-specific internal analytics tables:
+
+Table: new_evalrun
+- new_evalrunid (PK)
+- new_agentid (lookup to bot)
+- new_agentversion (text)
+- new_channel (choice: web, teams, d365)
+- new_datasetname (text)
+- new_trigger (choice: manual, scheduled, pipeline)
+- new_startedon, new_completedon
+- new_status (choice)
+
+Table: new_evalresult
+- new_evalresultid (PK)
+- new_evalrunid (lookup)
+- new_sessionid / new_conversationid (text)
+- new_transcriptid (lookup to transcript if available)
+- new_tasksuccess (bool)
+- new_groundingscore (decimal)
+- new_toolcorrectness (decimal)
+- new_latencymsp50 / p95 (optional)
+- new_turns (int)
+- new_safetyseverity (choice)
+- new_failurereason (choice)
+- new_notes (text)
+- new_createdon
+
+Table: new_evalartifact (optional for file uploads)
+- stores links to uploaded files, exception reports, cleaned outputs
+
+D) Joining transcripts/sessions to eval results
+----------------------------------------------
+At minimum, capture and persist:
+- conversation ID
+- session ID (if applicable)
+- transcript record ID (Dataverse GUID)
+- channel
+- agent ID and agent version
+
+This makes slicing/trending possible.
+
+================================================================================
+7) File upload workflows (CSV/XLSX/XML) — technical pattern + evaluation checkpoints
+================================================================================
+
+A) Conversational topic
+-----------------------
+- Use a file question node to request upload.
+- Immediately run deterministic validation before AI summarization.
+
+B) Power Automate (agent workflow) steps
+----------------------------------------
+1) Validate file:
+   - extension: csv/xlsx/xml
+   - size threshold (e.g., < 50 MB for chat uploads; confirm with your tenant settings)
+2) Store raw file:
+   - SharePoint/OneDrive location with controlled permissions
+   - write storage URL back to Dataverse BatchUpload record
+3) Parse:
+   - CSV -> table rows
+   - XLSX -> select sheet(s) -> rows
+   - XML -> parse to JSON -> validate nodes
+4) Normalize:
+   - map to canonical schema
+5) Validate:
+   - required columns/nodes
+   - data types
+   - uniqueness and key constraints
+6) Produce outputs:
+   - valid rows imported (Dataverse upsert)
+   - invalid rows -> exception report (CSV/XLSX)
+7) Return conversation response:
+   - counts: rows processed, rows rejected
+   - link to stored file and exception report
+
+C) Canonical Dataverse batch schema (recommended)
+-------------------------------------------------
+Table: new_batchupload
+- new_batchuploadid
+- new_filename
+- new_filetype (csv/xlsx/xml)
+- new_storageurl
+- new_rowcount
+- new_validrowcount
+- new_invalidrowcount
+- new_status
+- new_errorsjson
+- new_createdby, new_createdon
+
+Table: new_batchrow
+- new_batchrowid
+- new_batchuploadid (lookup)
+- new_rownumber
+- new_naturalkey
+- new_payloadjson
+- new_validationstatus
+- new_validationerrors
+
+D) Evaluation checkpoints for file uploads
+------------------------------------------
+- UploadSuccess (0/1)
+- ParseSuccess (0/1)
+- SchemaCompliance (0/1)
+- ValidationAccuracy (score)
+- UpsertCorrectness (score)
+- OutputIntegrity (score): cleaned/exported file matches intended transformations
+- Performance: time to parse + time to import + total time
+
+Hard fail conditions:
+- mapping to wrong fields
+- silent truncation
+- cross-record contamination (wrong natural key)
+- data leakage
+
+================================================================================
+8) Concrete Dataverse query examples (templates)
+================================================================================
+
+A) List agents
+--------------
+GET https://<org>.crm.dynamics.com/api/data/v9.2/bots?$select=botid,name,modifiedon
+
+B) List transcripts modified after watermark
+-------------------------------------------
+GET https://<org>.crm.dynamics.com/api/data/v9.2/conversationtranscripts?$select=conversationtranscriptid,modifiedon,conversationid,channel
+&$filter=modifiedon ge 2026-02-24T00:00:00Z
+&$orderby=modifiedon asc
+
+C) Query sessions for an agent + channel + time range
+-----------------------------------------------------
+GET https://<org>.crm.dynamics.com/api/data/v9.2/msdyn_botsessions?$select=msdyn_botsessionid,createdon,conversationid,channel,botid,outcome,statuscode
+&$filter=createdon ge 2026-02-24T00:00:00Z and botid eq <bot-guid> and channel eq 'teams'
+
+D) Write an EvalResult row (POST)
+---------------------------------
+POST https://<org>.crm.dynamics.com/api/data/v9.2/new_evalresults
+Body:
+{
+  "new_name": "Run 2026-02-24 / Session 123",
+  "new_tasksuccess": true,
+  "new_groundingscore": 0.92,
+  "new_toolcorrectness": 0.88,
+  "new_turns": 4,
+  "new_conversationid": "abc123",
+  "new_channel": 100000000,
+  "new_failurereason": 100000005
+}
+
+E) Upsert pattern (PATCH with alternate key)
+--------------------------------------------
+Define an alternate key on new_batchrow (new_batchuploadid + new_naturalkey), then:
+
+PATCH https://<org>.crm.dynamics.com/api/data/v9.2/new_batchrows(new_batchuploadid=<guid>,new_naturalkey='C12345')
+Body: { "new_payloadjson": "...", "new_validationstatus": 100000001 }
+
+================================================================================
+9) App Insights methodology (what to emit and how to correlate)
+================================================================================
+
+Emit/track at least:
+- Channel (web/teams/d365)
+- AgentId and AgentVersion
+- ConversationId / SessionId
+- ScenarioType (file_upload_pdf, file_upload_xlsx, faq, routing, etc.)
+- Dependency calls:
+  - connector name
+  - latency
+  - success/failure
+  - error code
+- Topic/tool transitions:
+  - topic name
+  - tool name
+  - node name (if available)
+  - start/end duration
+
+Correlation strategy:
+- Always include ConversationId and/or SessionId in both:
+  - Dataverse records (EvalResult, BatchUpload, business outcome record)
+  - App Insights customDimensions
+
+This lets you pivot performance and quality together.
+
+================================================================================
+10) Governance: Purview audit logging
+================================================================================
+
+Use Purview audit logs to answer:
+- who published the agent
+- who changed settings (transcripts enabled/disabled, permissions changes)
+- when an environment or bot configuration was modified
+
+Join governance events to regressions:
+- EvalRun shows a score drop on Feb 24
+- Audit logs show a publish event on Feb 23
+- App Insights shows increased connector failures after the publish
+
+================================================================================
+End of technical reference
+================================================================================

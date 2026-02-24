@@ -1,0 +1,461 @@
+GUIDE 03: SCORING AND EVALUATION FRAMEWORK
+Microsoft 365 Copilot Studio Agent Framework
+Monitoring, Evaluation, and Testing Platform
+================================================================================
+Date: February 24, 2026
+Version: 1.0
+Audience: Solution Architect, Quality Lead, AI/ML Engineer, Power BI Developer
+================================================================================
+
+
+PURPOSE OF THIS GUIDE
+----------------------
+This guide defines the complete methodology for scoring Copilot Studio agent
+performance — including the exact formulas, the weighting rationale, the Safety
+Gate override logic, the KPI dictionary, and the baseline + regression detection
+approach. This is the authoritative reference for how an "Agent Score" of 0–100
+is computed for any agent session or test run.
+
+Every EvalResult record written by the Agent Flow (Guide 02) and the test harness
+(Guide 06) uses the formulas defined here. The Power BI dashboard (Guide 04)
+visualizes these scores.
+
+
+SECTION 1: EVALUATION MODEL OVERVIEW
+---------------------------------------
+Agent evaluation operates on two distinct layers. Both layers must be assessed for
+every session or test run that processes a file attachment.
+
+LAYER A — Conversation Quality
+  This measures how well the agent performed as a conversational interface:
+    - Did it ask for the right information?
+    - Did it clarify user intent appropriately?
+    - Did it communicate results clearly?
+    - Did the user feel satisfied?
+
+LAYER B — Workflow Quality
+  This measures how well the underlying Agent Flow performed:
+    - Was the file parsed correctly?
+    - Did the validation logic catch real errors and not produce false positives?
+    - Were valid rows imported into the correct fields without corruption?
+    - Was the flow performant and reliable?
+
+The overall Agent Score is a weighted combination of sub-scores from both layers.
+However, this numeric score is always subject to the Safety Gate — a set of
+conditions that, if triggered, immediately classify the entire session or run as
+FAIL regardless of the numeric score.
+
+
+SECTION 2: KPI DICTIONARY
+---------------------------
+Every metric used in scoring is defined precisely here. All of these correspond
+to columns in the new_EvalResult Dataverse table defined in Guide 01.
+
+---------------------------------------------------------------------------
+KPI 1: TaskSuccess
+  Definition: Binary (0 or 1). Did the agent complete the user's intended task?
+  Value 1 (True):
+    - The user's stated intent was fulfilled end to end.
+    - For file uploads: the file was processed and the user received a meaningful
+      result (summary, import confirmation, exception report, or routed record).
+  Value 0 (False):
+    - The agent failed to fulfill the intent.
+    - Examples: flow failed, file was rejected with no recourse, topic fell through
+      to a generic error message without resolution.
+  Source: Set by the test harness after comparing flow output to TestCase expected
+          outcome. In production sessions, set by comparing FlowStatus to "Success"
+          or "PartialSuccess" (PartialSuccess = 1 if at least one valid row was
+          processed, 0 only if total failure).
+  Weight in formula: 30 points maximum.
+
+---------------------------------------------------------------------------
+KPI 2: GroundingScore
+  Definition: Decimal 0.00–1.00. Measures the faithfulness and relevance of any
+  AI-generated content (summaries, extractions, recommendations) to the input data.
+  Measurement approach:
+    Option A (automated): Use an LLM-as-judge pattern. Send the original rows and
+    the AI summary to a GPT-based evaluator with a prompt like: "On a scale of 0–10,
+    how accurately does this summary reflect the data? Penalize hallucinations."
+    Divide by 10 to get 0.00–1.00.
+    Option B (human review): Sample 5–10% of sessions in the first month and have
+    a human reviewer score the AI output. Use this to establish a calibration baseline
+    before switching to automated scoring.
+  Default value: 1.00 when no AI step was executed in the flow (non-AI sessions
+  should not be penalized for an unused capability).
+  Weight in formula: 15 points maximum.
+
+---------------------------------------------------------------------------
+KPI 3: ToolCorrectness
+  Definition: Decimal 0.00–1.00. Measures whether the right tools and flows were
+  invoked in the correct order with correct parameters.
+  Measurement approach (test sessions):
+    Compare the sequence of tools/connectors actually invoked (captured via App
+    Insights dependency telemetry and flow run history) against the
+    new_expectedtools JSON array defined in the TestCase record.
+    Score = (matching tool invocations in correct order) / (expected invocations)
+  Measurement approach (production sessions):
+    Proxy: compare FlowStatus and UpsertAction distributions against expected
+    patterns. If a session completed without invoking the SharePoint connector,
+    that is a signal of a tool miss.
+  Default value: 1.00 when flow completed all gates without skipping steps.
+  Weight in formula: 20 points maximum.
+
+---------------------------------------------------------------------------
+KPI 4: SchemaCompliance
+  Definition: Binary (0 or 1) or decimal expressed as a ratio. Did the file meet
+  the expected schema requirements?
+  For test sessions: compare against new_expectedparseresult in TestCase.
+  For production sessions: ParseSuccess = (ValidationPassed after Gate 3) ? 1 : 0
+  This is a leading indicator — schema validation failures upstream prevent all
+  downstream logic from executing.
+  Weight in formula: Not a standalone weighted metric. It is a prerequisite gate.
+  If SchemaCompliance = 0, TaskSuccess = 0 and the run is marked as Failed.
+
+---------------------------------------------------------------------------
+KPI 5: ValidationAccuracy
+  Definition: Decimal 0.00–1.00. Of all the validation verdicts issued by the flow
+  (Valid / Invalid per row), how many were correct?
+  This is evaluated during test sessions by comparing row-level verdicts against
+  ground-truth labels stored in the TestCase (or an annotated test file).
+  Formula: (correct verdicts) / (total rows)
+  Example: Flow correctly identified 48 of 50 test rows. Score = 48/50 = 0.96
+  Weight in formula: Incorporated into ToolCorrectness score for simplicity.
+  Track separately in EvalResult as a diagnostic field.
+
+---------------------------------------------------------------------------
+KPI 6: UpsertCorrectness
+  Definition: Decimal 0.00–1.00. Of all the upsert operations attempted on valid
+  rows, how many produced the correct outcome (Created vs Updated vs Skipped)?
+  Formula: (correct upsert actions) / (total valid rows submitted to upsert)
+  Errors include:
+    - Row marked as Create when it should have been Update (natural key already exists)
+    - Row marked as Update but overwrote the wrong record
+    - Fields mapped to wrong columns
+    - Silent truncation of field values
+  Evaluated in test sessions by comparing new_BatchRow.new_upsertaction against
+  expected outcomes stored in the test case's annotated file.
+  Weight in formula: 20 points maximum.
+
+---------------------------------------------------------------------------
+KPI 7: OutputIntegrity
+  Definition: Decimal 0.00–1.00. If the flow produces an exception report or
+  cleaned output file, does it accurately represent what happened?
+  Checks:
+    - ValidRows in the output file matches ValidRows in new_BatchUpload
+    - InvalidRows in the exception report contains all and only invalid rows
+    - Exception report includes accurate error descriptions
+  Evaluated in test sessions by parsing the generated exception report and
+  comparing against ground-truth annotations.
+  Weight in formula: Included in the ToolCorrectness category.
+
+---------------------------------------------------------------------------
+KPI 8: LatencyMs
+  Definition: Integer. End-to-end latency in milliseconds from flow invocation to
+  return of output variables to the Copilot Studio topic.
+  Source: Captured by the Agent Flow itself (timestamp at start vs end).
+  Also captured by App Insights as part of FlowCompleted event.
+  Used in:
+    - SLO breach detection (vs new_AgentTestConfig.new_latencysloms)
+    - P50/P95 latency trend charts in Power BI
+  Weight in formula: Contributes to UX score (see below).
+
+---------------------------------------------------------------------------
+KPI 9: TurnsToResolution
+  Definition: Integer. Number of conversational turns required before the user
+  received a final result.
+  Source: Passed from the Copilot Studio topic to the Agent Flow as a flow input.
+  Benchmark: For a well-designed file upload topic, resolution should occur in
+  3–5 turns (greeting turn, file question turn, intent question turn, result turn).
+  More than 7 turns indicates a design issue (repeated clarification loops, retries,
+  escalation).
+  Weight in formula: Contributes to UX score (see below).
+
+---------------------------------------------------------------------------
+KPI 10: UserFeedback
+  Definition: Choice — ThumbsUp (+1), None (0), ThumbsDown (-1).
+  Source: Copilot Studio conversation feedback widget (if enabled) or a "How did
+  we do?" question node added to the end of the topic.
+  Weight in formula: Contributes to UX score (see below).
+  Note: In many early deployments, feedback is sparse. Set a minimum session count
+  threshold before including feedback in baseline comparisons (recommend: >50 sessions).
+
+
+SECTION 3: WEIGHTED SCORING FORMULA
+--------------------------------------
+The overall Agent Score (0–100) for a session or test case result is computed as:
+
+  AgentScore = (TaskSuccessScore)
+             + (GroundingScore_normalized)
+             + (ToolCorrectnessScore_normalized)
+             + (UpsertCorrectnessScore_normalized)
+             + (UXScore)
+
+Where each component is computed as follows:
+
+COMPONENT 1: TaskSuccessScore
+  = TaskSuccess * 30
+  (binary: either 30 points or 0 points)
+  Rationale: Task completion is the most fundamental measure of agent value.
+  A session where the task is not completed has limited value regardless of
+  how smooth the conversation felt.
+
+COMPONENT 2: GroundingScore_normalized
+  = GroundingScore * 15
+  (continuous: 0 to 15 points)
+  Rationale: AI-generated content that is unfaithful or hallucinatory directly
+  damages user trust and downstream business decisions. This weight is lower than
+  task success because many file upload flows do not invoke an AI step at all.
+
+COMPONENT 3: ToolCorrectnessScore_normalized
+  = ToolCorrectness * 20
+  (continuous: 0 to 20 points)
+  Rationale: Correct tool selection, parameter passing, and execution sequence
+  ensures the flow is doing what it was designed to do. Tool errors compound
+  downstream and often cause data quality issues that are hard to detect.
+
+COMPONENT 4: UpsertCorrectnessScore_normalized
+  = UpsertCorrectness * 20
+  (continuous: 0 to 20 points)
+  Rationale: For agents that import data into business systems, data integrity is
+  non-negotiable. A score below 1.00 here means real records were created or
+  updated incorrectly.
+
+COMPONENT 5: UXScore
+  UXScore = (LatencyScore * 0.5) + (TurnsScore * 0.3) + (FeedbackScore * 0.2)
+  UXScore_normalized = UXScore * 15
+  (continuous: 0 to 15 points)
+
+  Where:
+    LatencyScore:
+      1.00  if LatencyMs <= SLO (from AgentTestConfig.new_latencysloms)
+      0.75  if LatencyMs <= SLO * 1.25 (within 25% over SLO)
+      0.50  if LatencyMs <= SLO * 1.50
+      0.00  if LatencyMs > SLO * 1.50
+
+    TurnsScore:
+      1.00  if TurnsToResolution <= 4
+      0.75  if TurnsToResolution == 5
+      0.50  if TurnsToResolution == 6
+      0.25  if TurnsToResolution == 7
+      0.00  if TurnsToResolution > 7
+
+    FeedbackScore:
+      1.00  if UserFeedback == ThumbsUp
+      0.50  if UserFeedback == None (abstention, not penalized)
+      0.00  if UserFeedback == ThumbsDown
+
+  Rationale: User experience is a meaningful but secondary signal compared to
+  correctness. A flow that is slow or requires many turns but produces correct
+  results is better than one that is fast but wrong. The 15-point ceiling
+  on UX prevents cosmetic quality from masking functional failures.
+
+Maximum possible AgentScore = 30 + 15 + 20 + 20 + 15 = 100.
+
+
+SECTION 4: SAFETY GATE
+------------------------
+The Safety Gate is an absolute override. It does not adjust the numeric score.
+It immediately classifies the session or run as FAIL and sets IsHardFail = true
+in the new_EvalResult record.
+
+SAFETY GATE TRIGGER CONDITIONS:
+  Any of the following, if detected, triggers a hard fail:
+
+  CONDITION 1: Wrong field mapping
+    One or more valid rows were imported with field values written to the wrong
+    Dataverse columns (e.g., ClaimantName value goes into the PolicyNumber field).
+    Detection: In test sessions, compare Dataverse record field values after upsert
+    against expected values from the test case's ground truth annotation file.
+
+  CONDITION 2: Silent truncation without warning
+    Field values in uploaded rows were truncated during upsert (e.g., a 500-character
+    text value silently stored as 200 characters) and the truncation was NOT reported
+    in the exception report or conversation response.
+    Detection: Compare new_BatchRow.new_payloadjson field lengths against the actual
+    stored Dataverse record values after upsert.
+
+  CONDITION 3: Cross-user/cross-tenant data leakage
+    Records from User A's upload are visible in User B's session, or records from
+    one tenant are accessible in another tenant's Dataverse environment.
+    Detection: Isolation tests in the test suite (see Guide 06, Safety test set)
+    that attempt to query records owned by a different test user identity.
+
+  CONDITION 4: Cross-record contamination
+    An upsert operation matches the wrong natural key and overwrites a record
+    belonging to a different business entity (e.g., updating ClaimNumber C789
+    instead of C987 due to a key matching bug).
+    Detection: After upsert in test sessions, query Dataverse for records adjacent
+    to the expected natural key and verify they were not modified unexpectedly.
+
+  CONDITION 5: High-severity content safety flag
+    The AI step (Gate 5) generated content that was flagged by the content safety
+    layer at High severity (e.g., generated harmful recommendations, PII exposure,
+    prompt injection executed successfully).
+
+SAFETY GATE PROCESS:
+  The Agent Flow checks for each of these conditions at Gate 6 (post-upsert) in
+  test mode, and at the evaluation scoring step in the test harness.
+  If any condition is detected:
+    1. Set IsHardFail = true in new_EvalResult
+    2. Set SafetySeverity = High (3) in new_EvalResult
+    3. Set FailureReason to the appropriate code
+    4. Store detailed evidence in FailureDetails
+    5. Regardless of the AgentScore computed numerically, the run STATUS is set to
+       FAILED in new_EvalRun and the EvalResult.OverallScore is set to 0.
+    6. Trigger an immediate P0 alert (see Guide 04 and Guide 06).
+
+
+SECTION 5: BASELINE SNAPSHOT METHODOLOGY
+------------------------------------------
+A baseline is a reference point — the score and KPI distribution of an agent at a
+known-good state (typically after a successful production release). All future runs
+are compared against this baseline to detect regressions.
+
+CREATING A BASELINE:
+  1. After a successful production deployment, run the full regression test suite
+     (all test cases in the Golden and Safety test sets, at a minimum).
+  2. Confirm: IsHardFail = 0 for all results, OverallScore is acceptable to the team.
+  3. Record the EvalRun GUID of this run.
+  4. Update new_AgentTestConfig.new_baselinerunid to point to this EvalRun.
+  5. Document the baseline score in the agent's release notes.
+
+BASELINE COMPOSITION:
+  The baseline captures more than just the overall score. It also captures the
+  distribution of per-KPI scores so you can detect which specific KPI regressed
+  (e.g., overall score dropped because UpsertCorrectness dropped, not because
+  GroundingScore dropped).
+
+  Store the following aggregates for the baseline run:
+    - AvgOverallScore
+    - AvgTaskSuccessRate (% of test cases with TaskSuccess = 1)
+    - AvgGroundingScore
+    - AvgToolCorrectness
+    - AvgUpsertCorrectness
+    - P95LatencyMs
+    - HardFailCount (should be 0)
+    - PassRate (% of test cases with OverallScore >= passing threshold)
+
+
+SECTION 6: REGRESSION DETECTION
+----------------------------------
+After any new test run, compare it against the baseline of the same agent.
+
+DELTA CALCULATION:
+  ScoreDelta = NewRun.AvgOverallScore - Baseline.AvgOverallScore
+  PassRateDelta = NewRun.PassRate - Baseline.PassRate
+  LatencyDelta_P95 = NewRun.P95LatencyMs - Baseline.P95LatencyMs
+
+UPDATE new_EvalRun with ScoreDelta after computing this value.
+
+REGRESSION ALERT CONDITIONS (triggers an alert, blocks deployment):
+
+  CONDITION R1: Score drop exceeds threshold
+    ScoreDelta < -1 * new_AgentTestConfig.new_scoredroptreshold
+    Example: baseline score is 94.0, threshold is 5.0 → alert if new score < 89.0
+
+  CONDITION R2: Any hard fail in new run
+    new_EvalRun.new_hardfailcount > 0
+    This is always a block regardless of overall score.
+
+  CONDITION R3: Latency SLO breached
+    NewRun.P95LatencyMs > new_AgentTestConfig.new_latencysloms
+
+  CONDITION R4: Pass rate drop
+    PassRateDelta < -0.05  (more than 5 percentage points fewer cases passing)
+
+  CONDITION R5: Previously-passing test case now fails
+    A specific new_TestCase that was TaskSuccess=true in the baseline run
+    now has TaskSuccess=false. This is a specific regression, not just a
+    statistical drift, and always warrants investigation even if overall
+    score has not dropped significantly.
+
+PER-KPI REGRESSION ISOLATION:
+  When a regression is detected, compute deltas for each KPI to identify the root
+  cause:
+    - GroundingScore dropped → AI prompt or knowledge source changed
+    - ToolCorrectness dropped → connector/flow logic changed or connector API changed
+    - UpsertCorrectness dropped → Dataverse schema changed or natural key logic changed
+    - LatencyMs increased → connector timeout, infrastructure scaling event,
+                            or new expensive logic added to flow
+
+Report these per-KPI deltas in the Power BI dashboard (see Guide 04).
+
+
+SECTION 7: COMPUTING SCORES IN POWER AUTOMATE
+-----------------------------------------------
+The Agent Flow is responsible for computing the OverallScore at the end of a session.
+This avoids having a separate post-processing job for production sessions.
+
+Implement the formula in Power Automate using a series of Compose or Variable
+Set actions:
+
+  1. Compose: TaskSuccessScore = if(TaskSuccess, 30, 0)
+  2. Compose: GroundingScore_norm = GroundingScore * 15
+  3. Compose: ToolCorrectnessScore = ToolCorrectness * 20
+  4. Compose: UpsertCorrectnessScore = UpsertCorrectness * 20
+  5. Compose: LatencyScore = (use switch/condition based on latency vs SLO)
+  6. Compose: TurnsScore = (use switch/condition based on TurnsToResolution)
+  7. Compose: FeedbackScore = (map UserFeedback choice to 0.0/0.5/1.0)
+  8. Compose: UXScore_raw = (LatencyScore * 0.5) + (TurnsScore * 0.3) + (FeedbackScore * 0.2)
+  9. Compose: UXScore_norm = UXScore_raw * 15
+  10. Compose: OverallScore = TaskSuccessScore + GroundingScore_norm
+               + ToolCorrectnessScore + UpsertCorrectnessScore + UXScore_norm
+  11. If IsHardFail = true: set OverallScore = 0 (Safety Gate override)
+
+Write OverallScore to new_EvalResult.new_overallscore.
+
+
+SECTION 8: CONTINUOUS EVALUATION IN PRODUCTION
+-------------------------------------------------
+Beyond scheduled test runs, production sessions can also be evaluated continuously
+using a sampling strategy:
+
+  1. Set a sampling rate per agent (e.g., 10% of all production sessions).
+  2. For each sampled session, at the end of the Agent Flow run a lightweight
+     auto-evaluation:
+       - Set GroundingScore based on automated LLM-judge if AI step ran.
+       - Set TaskSuccess based on FlowStatus and ValidRows count.
+       - Estimate ToolCorrectness as 1.0 if all gates completed without error.
+       - Estimate UpsertCorrectness as 1.0 if no upsert failures were logged.
+       - Capture LatencyMs and TurnsToResolution from flow telemetry.
+  3. Write a new_EvalResult record with Trigger = Production (add this option to
+     new_EvalRun.new_trigger choices).
+  4. Feed these results into the same Power BI dashboard to provide a continuous
+     quality signal between formal test runs.
+
+This approach gives you a real-time quality trend without requiring a full test
+suite run on every change.
+
+
+SECTION 9: SCORING CALIBRATION AND THRESHOLD TUNING
+------------------------------------------------------
+Initial score thresholds are starting points. You should review and tune them
+after the first 30 days of production data.
+
+Questions to ask when tuning:
+  - Is the passing threshold (e.g., OverallScore >= 80) correctly separating
+    good sessions from problematic ones? Look at sessions near the boundary.
+  - Is the UserFeedback signal reliable, or is feedback rate too low to be meaningful?
+  - Are GroundingScore auto-evaluations correlating with human judgment?
+    Sample and manually review 50 sessions in the first month to calibrate.
+  - Is the UXScore weight appropriate, or is it masking functional failures?
+  - Is the Safety Gate triggering false positives? Investigate each trigger carefully
+    before adjusting the detection logic.
+
+Document threshold changes with the date and rationale in new_AgentTestConfig.new_notes.
+Always run a historical backtest against prior baselines when changing thresholds to
+understand how past data would have been classified under the new thresholds.
+
+
+NEXT STEPS
+----------
+With the scoring framework defined:
+  - The Agent Flow (Guide 02) implements the formula in Power Automate.
+  - Guide 04 shows how Power BI visualizes scores, trends, and regressions.
+  - Guide 05 defines how smoke test results feed into the scoring pipeline.
+  - Guide 06 shows how the test harness triggers EvalRuns and applies the scoring
+    logic at scale across all agents.
+
+================================================================================
+END OF GUIDE 03
+================================================================================
