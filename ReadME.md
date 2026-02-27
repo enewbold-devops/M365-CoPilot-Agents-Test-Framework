@@ -1,4 +1,4 @@
-# M365 Copilot Studio Agent Framework
+# M365 Copilot Studio Agent Test Framework
 ## Monitoring · Scoring · Evaluation · Testing · LangGraph Orchestration
 ### Session Analysis & Implementation Methodology
 **Sessions:** February 24, 2026 (Framework Design) · February 26, 2026 (LangGraph Augmentation)  
