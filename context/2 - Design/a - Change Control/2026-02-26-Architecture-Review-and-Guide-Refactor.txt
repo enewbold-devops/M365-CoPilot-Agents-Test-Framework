@@ -1,0 +1,476 @@
+CHANGE CONTROL — ARCHITECTURE REVIEW AND GUIDE REFACTOR
+Microsoft 365 Copilot Studio Agent Framework
+Monitoring, Evaluation, and Testing Platform
+================================================================================
+Date:     February 26, 2026
+Session:  Design Review and Implementation
+Scope:    Agent Test Framework Architecture + Guide 02 and Guide 06 Refactor
+Author:   AI Engine (GitHub Copilot — Claude Sonnet 4.6)
+Status:   IMPLEMENTED
+================================================================================
+
+
+PART 1: SESSION CONTEXT
+------------------------
+This document records the full design discussion, architectural analysis, and
+implementation decisions made during the February 26, 2026 working session on
+the M365 Copilot Studio Agent Framework.
+
+The session began with a broad discussion of what a well-structured agent test
+framework should look like for the Power Platform, then narrowed to a detailed
+analysis of the six existing design guides (Guide 01 through Guide 06), and
+concluded with a concrete refactor of Guide 02 and Guide 06 to resolve identified
+architectural gaps. All changes discussed were implemented in the same session
+and are reflected in the current state of both guide files.
+
+
+PART 2: AGENT TEST FRAMEWORK — CONCEPTUAL DISCUSSION
+------------------------------------------------------
+Before the guide analysis, we aligned on the foundational structure a mature
+Copilot Studio agent test framework should have. Key principles agreed upon:
+
+2.1 Two-Layer Evaluation Model
+  Every agent session or test execution must assess two distinct layers:
+    - Layer A: Conversation Quality — did the agent interact correctly?
+      This includes intent recognition, topic resolution, turn count,
+      clarification handling, and response coherence.
+    - Layer B: Workflow Quality — did the underlying flow execute correctly?
+      This includes file parsing, validation accuracy, upsert correctness,
+      exception report completeness, and latency.
+  Neither layer alone is sufficient. A conversation that resolves correctly
+  but produces wrong data records is a failure. A flow that processes data
+  correctly but was reached via the wrong intent is also a failure.
+
+2.2 Test Suite Organization
+  Four test suites were agreed upon:
+    - Smoke: publish validation, core intents, basic upload path. Fast and cheap.
+      Must pass before any other suite runs.
+    - Regression (Golden set): 20–30 test cases covering top intents and all
+      supported file types (CSV, XLSX, XML, PDF). Runs nightly and pre-release.
+    - Safety: prompt injection, PII handling, path traversal, cross-user isolation,
+      idempotency, silent truncation. Required for all deployment gates.
+    - Performance: P95 latency under SLO, near-limit file size, connector timeout
+      recovery, parallel load. Required for staging and production gates.
+
+2.3 Test Level Model
+  Tests were classified into four levels based on their invocation requirements:
+    L1 — HTTP POST directly to the Core flow. Deterministic, synchronous.
+         Covers 85%+ of all test cases.
+    L2 — Direct Line API. Required only when real user identity or channel
+         session handling must be tested (cross-user isolation, parallel channels).
+    L3 — Direct Line API, full end-to-end conversation. Tests topic intent
+         recognition, NODE 5/6 display, and the full Adapter → Core path.
+    L4 — Direct Line API per channel. Web vs Teams vs Dynamics 365 parity.
+
+2.4 Canonical Test Case Model
+  Every test case should define:
+    - Identity: TestId, Intent, Channel, AgentVersion
+    - Input: prompt text, optional file artifact (URL, size, type, MIME)
+    - Expected: flow status, valid/invalid row counts, create/update counts,
+      exception report presence, isHardFail
+    - Scoring: overallScore threshold, latency SLO reference
+    - Verdict: PASS/FAIL with reason code
+
+2.5 Scoring Model with Hard Gates
+  Agreed weighting for the 0–100 agent score:
+    - Outcome success (TaskSuccess):     30%
+    - Workflow/Upsert correctness:       25%
+    - Answer quality (GroundingScore):   20%
+    - UX/Latency:                        15%
+    - Safety/Compliance:                 10%
+  Hard FAIL gate overrides score to 0 and blocks deployment regardless of weight
+  if any of the following is detected:
+    - Cross-user data leakage
+    - Silent field truncation
+    - High-severity safety event
+    - Prompt injection causing behavior change
+    - Upsert writing to wrong tenant/user record
+
+2.6 CI/CD Execution Pattern (agreed approach)
+  On every agent or flow change:
+    Step 1 — Run smoke test (mandatory precondition).
+    Step 2 — Run golden regression set via harness HTTP invocation (L1).
+    Step 3 — Compare OverallScore against baseline. Block if any of the 7
+             quality gates fail (defined in Guide 06 Section 7).
+    Step 4 — For staging/production: run Safety and Performance sets.
+  Results persist to Dataverse (EvalRun, EvalResult, BatchUpload).
+  Correlated to App Insights via ConversationId.
+  Surfaced in Power BI via Guide 04 dashboard.
+
+
+PART 3: EXISTING GUIDE ANALYSIS
+---------------------------------
+All six design guides were read in full before changes were made. This section
+records the key findings from that analysis.
+
+3.1 Guide 01 — Dataverse Schema and Setup
+  Status: No changes required in this session.
+  Observation: The schema (BatchUpload, BatchRow, EvalRun, EvalResult, TestCase,
+  AgentTestConfig) is sound and correctly serves as the evaluation warehouse.
+  The InputContract/OutputContract architecture introduced in Guide 02 v2.0 does
+  not require new Dataverse tables — results continue to flow into the existing
+  tables via Gate 7 of the Core flow. The only anticipated future addition is a
+  framework configuration row (new_AgentFrameworkConfig) to store the Core flow
+  trigger URL version and input schema version as environment-level metadata,
+  but this was deferred.
+
+3.2 Guide 02 — Power Automate and Agent Flow Implementation
+  Status: REFACTORED (see Part 4).
+  Critical finding: The original guide defined a single monolithic Agent Flow
+  with a Power Virtual Agents (PVA) trigger. This had three structural problems:
+
+    Problem 1 — Test harness cannot call PVA-trigger flows directly.
+      PVA-type flows are only invocable from within a Copilot Studio topic via
+      the "Call an action" node. The test harness (Guide 06) had to reach the
+      flow via the Direct Line API for every single test case, including purely
+      functional file processing tests that have no conversational requirement.
+      This is unnecessary overhead and creates timing dependencies.
+
+    Problem 2 — Direct Line polling is fragile.
+      The existing harness approach (Guide 06 Section 3) used a polling loop:
+      send a message, poll every 2-3 seconds, stop after 120 seconds or when the
+      bot responds. This creates timeout risk, non-deterministic timing, and
+      significant complexity for what is fundamentally a synchronous operation
+      (POST a file, get a result).
+
+    Problem 3 — Duplicate scoring logic.
+      The Agent Flow computed scores using the Guide 03 formula. The test harness
+      in Guide 06 also applied the Guide 03 formula to the bot response. Two
+      implementations of the same formula creates drift risk. If scoring weights
+      change in Guide 03, both places must be updated.
+
+3.3 Guide 03 — Scoring and Evaluation Framework
+  Status: No changes required in this session.
+  Observation: The scoring formula and Safety Gate definitions are authoritative.
+  In the refactored architecture, Guide 03 remains the specification document.
+  The formula is now executed in exactly one place: Gate 7 of CloudFlow-FileUpload-Core.
+  Guide 03 Section 7 (formerly the section describing score computation in the flow)
+  remains the reference that Gate 7 implements. No duplication.
+
+3.4 Guide 04 — Power BI Monitoring Dashboard
+  Status: No changes required in this session.
+  Observation: The dashboard reads from Dataverse tables (EvalResult, EvalRun,
+  BatchUpload). Since the refactored architecture continues to write to the same
+  tables (Gate 7 writes EvalResult; Gate 2 writes BatchUpload), the dashboard
+  data model is unaffected. The addition of overallScore in OutputContract does
+  not change where the score is stored — it is still new_EvalResult.new_overallscore.
+
+3.5 Guide 05 — Smoke Test Agent and Flow
+  Status: Minor implications noted, no guide text changes in this session.
+  Observation: The smoke test flow was designed to validate the core platform stack
+  by calling individual connectors (Dataverse, SharePoint, Graph). In the refactored
+  architecture, the smoke test can validate the entire stack more efficiently by
+  sending a synthetic InputContract (with isTestMode=true and a minimal smoke test
+  file) directly to CloudFlow-FileUpload-Core via HTTP POST. This exercises every
+  integration point in a single call: SharePoint file storage (Gate 2), Dataverse
+  write (Gate 2 BatchUpload), parsing (Gate 3), validation (Gate 4), and App
+  Insights emission (Section 2.8). This simplification was noted as a future
+  enhancement to Guide 05 but was not implemented in this session to keep scope
+  focused on the Guide 02/06 refactor.
+
+3.6 Guide 06 — Multi-Agent Testing Pipeline and Deployment Plan
+  Status: REFACTORED (see Part 5).
+  Critical finding: The entire test invocation section (Section 3) was built around
+  Direct Line polling for all test cases, including functional tests that do not
+  require conversational context. Additionally, scoring was performed in the harness
+  (duplicate of the flow), and the development checklist did not reflect the
+  dual-flow contract requirements.
+
+
+PART 4: GUIDE 02 REFACTOR — DESIGN DECISIONS AND RATIONALE
+------------------------------------------------------------
+This section documents every design decision made during the Guide 02 refactor,
+including alternatives that were considered and rejected.
+
+4.1 Decision: Split into Adapter + Core (dual-flow)
+  Decision: Replace the single monolithic Agent Flow with two cooperating flows:
+    - AgentFlow-FileUpload-Adapter (PVA trigger, thin wrapper)
+    - CloudFlow-FileUpload-Core (HTTP trigger, all business logic)
+  Rationale: The Adapter keeps the Copilot Studio topic integration unchanged
+  (the topic still calls "an action" in the standard way). The Core flow becomes
+  independently callable by any HTTP-capable client, making test harness invocation
+  deterministic and synchronous.
+  Alternative considered: Keep a single flow and add a secondary HTTP-triggered
+  wrapper flow that duplexes calls. Rejected because this would create two entry
+  points to the same logic with different input shapes, increasing maintenance risk.
+
+4.2 Decision: HTTP trigger (not child flow) for the Core flow
+  Decision: Use an HTTP Request trigger on CloudFlow-FileUpload-Core.
+  Rationale (selected by the user during the session):
+    - The HTTP trigger makes the Core flow callable from Power Automate, Azure
+      DevOps YAML steps, Postman, and Azure Functions without adapters.
+    - This future-proofs the architecture for the Guide 06 Phase 3 option (Azure
+      DevOps pipeline with a PowerShell or Python test script).
+    - A child flow trigger (Power Automate "Run a Child Flow") would restrict
+      callers to Power Automate only, requiring a wrapping flow for Azure DevOps.
+  Alternative rejected: Child flow trigger. Would require an additional HTTP-to-PA
+  bridge flow for Azure DevOps integration.
+
+4.3 Decision: Authentication via SAS-embedded trigger URL stored in Key Vault
+  Decision: The Core flow trigger URL (which includes a SAS token) is stored in
+  Azure Key Vault under the secret name "CoreFlow-FileUpload-TriggerUrl". Both the
+  Adapter and the test harness retrieve this secret at runtime.
+  Rationale: This is the simplest auth approach for Phase 1. The SAS token is
+  embedded in the URL, so no additional auth headers are needed for Power Automate
+  callers. Key Vault provides access control and rotation capability.
+  Caveats documented: The URL must be updated in Key Vault whenever the Core flow
+  is republished (Power Automate regenerates the SAS token on publish). Teams should
+  establish a post-publish runbook step to refresh the Key Vault secret.
+  Advanced option noted: Managed identity authentication is preferred for Azure
+  DevOps and Azure Function callers in Phase 3.
+
+4.4 Decision: Gate 7 is the single location for scoring
+  Decision (selected by the user during the session): The Guide 03 weighted scoring
+  formula is computed inside CloudFlow-FileUpload-Core as Gate 7. The score is
+  returned in OutputContract.overallScore. The test harness reads it — it does not
+  recompute it.
+  Rationale: Single source of truth. If scoring weights or formula change, only
+  Gate 7 changes — the harness and the Power BI dashboard read the stored value
+  from new_EvalResult.new_overallscore.
+  Alternative rejected: Keep scoring in the harness post-step. Rejected because
+  the same formula would have to be maintained in two places (Gate 7 for the
+  EvalResult write, and the harness for the gate evaluation).
+
+4.5 Decision: EvalResult written by Gate 7 (not by the harness)
+  Decision: Gate 7 writes the new_EvalResult record to Dataverse whenever the
+  InputContract.evalRunId field is non-null. The harness confirms the record was
+  written and patches TaskSuccess (the comparison outcome).
+  Rationale: The Core flow already has all the metric variables in scope at Gate 7
+  (TotalRows, ValidRows, OverallScore, LatencyMs, etc.). Writing from the flow
+  avoids a second Dataverse round-trip from the harness and ensures the record
+  is written even if the harness child flow fails after receiving the OutputContract.
+  Harness responsibility: Patch TaskSuccess (the pass/fail comparison result)
+  because this comparison happens in the harness (comparing OutputContract against
+  TestCase expected values). The Core flow cannot know what the expected values are.
+
+4.6 Decision: IsTestMode behavior collapsed inline into gate steps
+  Decision: Removed the standalone Section 3 (IsTestMode FLAG PATTERN) and
+  replaced it with a concise summary section that points readers to the relevant
+  gate steps where the behavior is defined inline.
+  Rationale: Having a separate section describing what each gate does under
+  IsTestMode=true created a documentation sync problem — if a gate's test behavior
+  changed, two places had to be updated. Inline documentation inside each gate
+  step eliminates this duplication.
+
+4.7 Decision: Section 5 (testing in isolation) updated to HTTP POST
+  Decision: The five manual test cases in Section 5 now describe HTTP POST requests
+  (with full InputContract bodies) sent to the Core flow trigger URL, rather than
+  using the "Test flow" button in Power Automate (which only works for manually-
+  triggered or PVA-trigger flows, not HTTP-trigger flows).
+  Additional verification steps added: confirm Dataverse BatchUpload record, confirm
+  no production records written, confirm App Insights events appear.
+
+4.8 Contract stability policy documented
+  Decision: A note was added that the InputContract and OutputContract must be
+  treated as stable interfaces. Additions are allowed (backward-compatible). Field
+  renames or removals require a version bump. This protects the harness and the
+  Adapter from being silently broken by flow changes.
+
+
+PART 5: GUIDE 06 REFACTOR — DESIGN DECISIONS AND RATIONALE
+------------------------------------------------------------
+
+5.1 Decision: Version bump to 2.0, dependency updated
+  The guide version was updated from 1.0 to 2.0 to reflect the breaking change
+  in test invocation approach. The dependency on Guide 02 was updated to
+  specifically reference "Guide 02 v2.0 — Dual-flow architecture."
+
+5.2 Decision: Test level classification table added (Section 2)
+  A formal test level table was added at the top of Section 2, before the test
+  case definitions, mapping each level (L1/L2/L3/L4) to its invocation method
+  and applicable test cases. This gives QA leads and Release Managers an immediate
+  orientation to the execution model before reading individual test cases.
+
+5.3 Decision: All test cases tagged with [L1] or [L2]
+  Every test case identifier (F-001 through F-012, S-001 through S-006,
+  P-001 through P-005) was tagged inline with its test level. S-005
+  (cross-user isolation) and P-004 (parallel upload simulation) are the only
+  cases tagged [L2]. Both include explanatory notes documenting why they
+  require Direct Line rather than the HTTP invocation path:
+    - S-005: Identity isolation is enforced at the conversational/topic layer
+      (Entra ID user identity in the Direct Line session), not inside the flow.
+      The Core flow receives the userId field in its InputContract, but the
+      isolation test must verify that the topic/adapter layer correctly routes
+      the authenticated identity — not just that the flow uses the field correctly.
+    - P-004: Parallel channel load testing requires distinct Direct Line conversations
+      (conversation IDs, session state) to simulate real concurrent users. HTTP
+      POST can test parallel Core flow execution but cannot validate that simultaneous
+      Direct Line sessions don't contaminate each other.
+
+5.4 Decision: Section 3 split into 3A (HTTP) and 3B (Direct Line)
+  Section 3 was renamed to "Test Invocation" and split into two sub-sections.
+
+  Section 3A (new) — HTTP Invocation for L1 Tests:
+    An 8-step process replacing the 6-step Direct Line polling loop for all L1 cases:
+      Step A: Read TestCase from Dataverse
+      Step B: Build InputContract JSON (Compose)
+      Step C: POST to CloudFlow-FileUpload-Core (synchronous, no polling)
+      Step D: Receive and parse OutputContract (HTTP 200 response)
+      Step E: Compare OutputContract against TestCase expected fields
+      Step F: Read OverallScore and IsHardFail from OutputContract (no recomputation)
+      Step G: Confirm EvalResult written by Gate 7; patch TaskSuccess
+      Step H: Apply Safety Gate check at harness level (increment hard fail counter)
+    Key improvement: Steps C and D in the new 3A replace the old Steps C, D, E
+    (send message + polling loop + 120-second timeout) with a single synchronous
+    HTTP exchange. Estimated time saving: 15–30 seconds per L1 test case.
+
+  Section 3B (retained) — Direct Line Invocation for L2/L3/L4 Tests:
+    The original Steps A through F are preserved verbatim, relabeled for L2/L3/L4
+    use only. A warning note was added at the top of 3B directing readers to use
+    3A for all cases not explicitly tagged L2/L3/L4.
+    Scoring note added to Step E: "overallScore is sourced from
+    OutputContract.overallScore (computed in Gate 7 by the Core flow). Do not
+    recompute it here." This ensures even the Direct Line path reads the
+    authoritative score from the flow.
+
+5.5 Decision: Section 4 updated for HTTP-based parallelism
+  The parallel execution section was updated to remove the "Direct Line collision"
+  concern (which was the reason L1 cases previously had to run sequentially within
+  an agent). Since L1 tests are now independent HTTP POSTs with unique synthetic
+  conversationIds, there is no shared session state to collide.
+  A new risk note was added: verify that CloudFlow-FileUpload-Core does not have
+  a flow-level concurrency limit set that would inadvertently serialize parallel
+  harness calls.
+  Average test time estimate updated: 20 seconds/test (with polling) → 15 seconds/
+  test (synchronous HTTP), reducing a 5-agent × 15-case nightly run from ~25 minutes
+  to ~19 minutes.
+
+5.6 Decision: Section 7 Gate 1 and Gate 6 annotated with score source
+  Two gates were updated to explicitly document where their input values originate
+  in the refactored architecture:
+    - Gate 1 (Hard fail): isHardFail is sourced from OutputContract.isHardFail
+      returned by Gate 7 of the Core flow. The harness increments the EvalRun
+      hard fail counter but does not determine the hard fail flag itself.
+    - Gate 6 (Score delta): OverallScore is sourced from OutputContract.overallScore.
+      The harness does not recompute the Guide 03 formula. The EvalRun aggregate
+      score is the average of all EvalResult scores for that run.
+
+5.7 Decision: Section 9 Phase 1 entry criteria updated
+  Phase 1 entry criteria now explicitly requires Guide 02 v2.0 dual-flow
+  architecture to be deployed and tested. A verification step was added requiring
+  manual Postman/HTTP POST validation of CloudFlow-FileUpload-Core before enabling
+  the automated harness. This prevents Phase 1 from failing due to flow
+  misconfiguration that would have been caught by simple isolated testing.
+
+5.8 Decision: Section 10 development checklist fully rewritten
+  The 4 generic checklist items from v1.0 were replaced with 9 specific, verifiable
+  items organized around the dual-flow contract:
+    - Core flow trigger URL in Key Vault
+    - Adapter retrieves URL and maps InputContract correctly
+    - Adapter relays all OutputContract fields to topic
+    - InputContract includes isTestMode, evalRunId, testCaseId
+    - Gate 7 computes OverallScore and IsHardFail in OutputContract
+    - Gate 7 writes EvalResult when evalRunId is non-null
+    - App Insights events emitted before HTTP Response fires
+    - Gate 6 sets new_istestdata=true when isTestMode=true
+    - Harness reads OverallScore from OutputContract (not recomputed)
+
+
+PART 6: WHAT REMAINS UNCHANGED
+--------------------------------
+The following elements of the framework were explicitly reviewed and confirmed
+unchanged during this session:
+
+  - Guide 01 Dataverse schema: no table additions or column changes required.
+  - Guide 03 scoring formula and Safety Gate taxonomy: the authoritative spec.
+    Only execution location changed (from harness to Gate 7); formula itself
+    is not modified.
+  - Guide 04 Power BI data model and pages: reads from the same Dataverse tables.
+    OutputContract changes do not affect the dashboard because data is still
+    stored in new_EvalResult.new_overallscore.
+  - All 23 test case inputs and expected outcomes (F/S/P): content unchanged.
+    Only test level labels [L1]/[L2] and invocation method were updated.
+  - Section 2 (Golden Dataset Design): test case content identical to v1.0.
+  - Section 5 (Cross-Agent Consistency Validation): unchanged.
+  - Section 6 (Test Data Lifecycle): unchanged.
+  - Section 8 (Observability and Alerting): unchanged.
+  - Section 9 Phase 2 onward: unchanged.
+  - Topic design in Guide 02 Section 1: unchanged. The NODE sequence (File Question,
+    Intent Clarification, Confirmation, Call Action, Branch, Structured Output)
+    is identical. The topic still calls the Adapter via "Call an action" and
+    receives the same output variable names as before.
+
+
+PART 7: IMPLEMENTATION SUMMARY
+--------------------------------
+All changes described in this document were implemented in the same session.
+No deferred items remain open from the refactor scope as agreed.
+
+Files modified:
+  context/2 - Design/Guide-02-Power-Automate-Agent-Flow-Implementation.txt
+    Version: 1.0 → 2.0
+    Changes: Header, purpose block, Section 2 (Sections 2A/2B/2C added),
+             Gate 7 added, Section 2.8 updated, Section 2.9 removed,
+             Section 3 collapsed, Section 4 timeout note updated,
+             Section 5 rewritten (HTTP invocation), NEXT STEPS updated.
+
+  context/2 - Design/Guide-06-Multi-Agent-Testing-Pipeline-and-Deployment-Plan.txt
+    Version: 1.0 → 2.0
+    Changes: Header, purpose dependencies, Section 1 Option A description,
+             Section 2 test level table added, all 23 test cases tagged [L1]/[L2],
+             Section 3 split into 3A and 3B, Section 4 parallelism notes updated,
+             Section 7 Gate 1 and Gate 6 score source annotations,
+             Section 9 Phase 1 entry criteria and deliverables updated,
+             Section 10 development checklist rewritten.
+
+Files not modified:
+  context/2 - Design/Guide-01-Dataverse-Schema-and-Setup.txt          (no changes)
+  context/2 - Design/Guide-03-Scoring-and-Evaluation-Framework.txt    (no changes)
+  context/2 - Design/Guide-04-Power-BI-Monitoring-Dashboard.txt       (no changes)
+  context/2 - Design/Guide-05-Smoke-Test-Agent-and-Flow.txt           (noted for future)
+
+
+PART 8: OPEN ITEMS AND FUTURE CONSIDERATIONS
+---------------------------------------------
+The following items were identified during the session but deferred:
+
+8.1 Guide 05 Smoke Test simplification
+  Context: The smoke test flow could be simplified to a single HTTP POST to
+  CloudFlow-FileUpload-Core (with a synthetic smoke InputContract) rather than
+  individual connector health checks. This exercises the full integration stack
+  in one call.
+  Deferred: Future session. Guide 05 is functional as-is; simplification is
+  an optimization, not a blocker.
+
+8.2 Guide 01 Framework Config row
+  Context: The Core flow trigger URL version and InputContract schema version
+  could be stored as a Dataverse configuration row (new_AgentFrameworkConfig)
+  so callers can self-validate compatibility before making calls.
+  Deferred: Future session. Key Vault secret approach is sufficient for Phase 1–2.
+
+8.3 Key Vault trigger URL rotation runbook
+  Context: Power Automate regenerates the SAS token in the HTTP trigger URL on
+  every flow publish. A runbook (or automated pipeline step) should refresh the
+  Key Vault secret after each Core flow publish.
+  Deferred: Operations team to define. Should be included in the Section 10
+  deployment checklist in a future Guide 06 update.
+
+8.4 Async pattern for large files
+  Context: If files regularly exceed the 90-second Adapter timeout, an async
+  pattern (HTTP 202 Accepted + status polling by BatchUploadId) should be
+  implemented in CloudFlow-FileUpload-Core.
+  Deferred: Implement if P-002 (near-limit file latency test) consistently
+  breaches the SLO window. The async design is noted in Guide 02 Section 4.
+
+8.5 L3/L4 test case corpus
+  Context: No L3 or L4 test cases were defined in the golden dataset.
+  The current corpus is all L1 and two L2 cases.
+  Deferred: Define L3 cases (full end-to-end conversation flows) and L4 cases
+  (channel parity) as a Phase 2 deliverable when Direct Line infrastructure
+  is established.
+
+8.6 turnsToResolution tracking in production
+  Context: The InputContract includes turnsToResolution but the Adapter flow
+  defaults it to 1 in production (the topic does not currently track turn count).
+  Deferred: The topic could be enhanced to count turns before the file question
+  node and pass the count as an additional input variable to the Adapter.
+  This enriches the evaluation data for Guide 03 UX scoring.
+
+
+PART 9: VERSION HISTORY FOR THIS CHANGE RECORD
+------------------------------------------------
+  2026-02-26  v1.0  Initial creation — records full February 26, 2026 session.
+
+================================================================================
+END OF CHANGE CONTROL DOCUMENT
+================================================================================

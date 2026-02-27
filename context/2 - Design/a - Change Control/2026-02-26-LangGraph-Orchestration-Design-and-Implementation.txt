@@ -1,0 +1,713 @@
+LANGGRAPH ORCHESTRATION FOR COPILOT STUDIO AGENT TESTING
+Design Discussion, Analysis, and Implementation Record
+================================================================================
+Date: February 26, 2026
+Session Type: Architecture Design + Implementation
+Audience: Solution Architect, QA Lead, Power Platform Maker, AI Engineer
+Related Guides: Guide 01 through Guide 06 (context\2 - Design\)
+================================================================================
+
+
+PURPOSE OF THIS DOCUMENT
+--------------------------
+This document is a narrative record of the design discussion, framework analysis,
+and implementation decisions made on February 26, 2026. It covers:
+
+  1. An introduction to LangChain and LangGraph as frameworks
+  2. The strategic case for using LangGraph to orchestrate Copilot Studio agent
+     testing, and how it complements the existing Power Automate-based framework
+  3. A detailed analysis of the existing evaluation and testing framework defined
+     in Guides 01-06, with identification of structural gaps and opportunities
+  4. The architecture decisions made collaboratively during this session
+  5. A full description of the LangGraph implementation built during this session,
+     including node design, routing logic, state schema, and file structure
+
+
+SECTION 1: LANGCHAIN AND LANGGRAPH — FRAMEWORK OVERVIEW
+---------------------------------------------------------
+
+1.1 LangChain
+
+LangChain is a Python (and TypeScript) framework for building applications powered
+by large language models (LLMs). Its core value is composability: it provides
+standardised building blocks — prompts, LLM wrappers, tool integrations, retrievers,
+memory stores — that can be chained together to form AI-driven pipelines.
+
+Key primitives:
+  - Chains:     Compose sequences of LLM calls and tool invocations
+  - Agents:     LLMs that dynamically select tools at runtime
+  - Retrieval:  Connect LLMs to external data sources (RAG patterns)
+  - Memory:     Maintain conversational state across turns
+  - Tools:      Search, databases, APIs, code execution, etc.
+
+LangChain is best suited to: simple prompt-response chains, single-agent
+tool use, RAG retrieval pipelines, and lightweight agentic loops.
+
+1.2 LangGraph
+
+LangGraph is built on top of LangChain and extends it with a fundamentally
+different execution model: directed graphs with shared, typed state. Where
+LangChain chains are linear sequences, LangGraph supports:
+
+  - Nodes:          Python functions or agents that read and write shared state
+  - Edges:          Static or conditional control flow between nodes
+  - Cycles:         Loops and retry patterns (not possible in simple chains)
+  - Shared State:   A TypedDict threaded through the entire graph execution
+  - Checkpointing:  Persistent state across interruptions (MemorySaver, SqliteSaver,
+                    PostgresSaver) enabling durable multi-step workflows
+  - Human-in-the-loop: interrupt() primitive pauses graph execution and returns
+                    control to a caller, who resumes the graph with new input
+
+LangGraph is best suited to: multi-step workflows with branching, stateful agent
+orchestration, human approval gates, adaptive retry logic, and any scenario where
+a linear chain is insufficient to model the decision complexity.
+
+
+SECTION 2: STRATEGIC CASE FOR LANGGRAPH IN COPILOT STUDIO TESTING
+-------------------------------------------------------------------
+
+2.1 The Opportunity
+
+The existing framework defined in Guides 01-06 is a well-structured Power Platform
+solution built on Dataverse, Power Automate, and Power BI. It handles the core
+concerns of agent evaluation well: a clean schema (Guide 01), a dual-flow HTTP
+architecture (Guide 02), a rigorous scoring formula (Guide 03), and a 7-gate
+CI/CD quality gate (Guide 06).
+
+However, several structural gaps exist that Power Automate cannot elegantly address:
+
+  - The test harness (Guide 06 Option A) is stateless across runs — there is no
+    adaptive routing based on what failed and why.
+  - The grounding score (KPI 2, Guide 03) explicitly requires human annotation
+    before automated scoring can be applied. No automation path is defined.
+  - Root cause analysis when gates fail is entirely manual — an engineer reviews
+    the Power BI dashboard and interprets failure patterns.
+  - No dynamic test case generation exists. New test cases are manually authored.
+  - The Direct Line polling pattern for L2/L3/L4 tests (Guide 06 Section 3B) is
+    described as fragile in Guide 02 itself.
+  - Human approval before deployment is not implemented in the Power Automate harness.
+
+LangGraph addresses all of these gaps:
+
+  Gap                              LangGraph Solution
+  ─────────────────────────────    ────────────────────────────────────────────
+  Stateless PA harness             Shared state (TestOrchestratorState) threaded
+                                   through all nodes, persisted via checkpointer
+  Manual grounding scoring         LLM evaluation node scores grounding per KPI 2
+                                   definition using OutputContract as evidence
+  No root cause analysis           Dedicated root_cause_node: LLM receives full
+                                   results set and produces structured RCA output
+  No dynamic test generation       test_gen_node: LLM generates candidate TestCase
+                                   records from observed failure patterns
+  No human approval gate           human_review_node uses LangGraph interrupt()
+                                   to pause graph and await operator decision
+  Fragile Direct Line polling      Conditional edges route L2-L4 as stubs in
+                                   Phase 1; Phase 2 will integrate the
+                                   microsoft-agents-copilotstudio-client package
+
+2.2 The Complementary Relationship
+
+A critical design decision made during this session was that LangGraph WRAPS
+the existing Power Automate dual-flow architecture rather than replacing it.
+
+The CloudFlow-FileUpload-Core (Guide 02 Section 2C) remains the execution engine
+for all file processing logic. The LangGraph harness calls it via HTTP POST using
+the stable InputContract/OutputContract interface defined in Guide 02 Section 2A.
+This means:
+
+  - The Power Automate flows do not need to be changed.
+  - The Dataverse schema (Guide 01) remains the single source of truth.
+  - The CI/CD gates from Guide 06 are evaluated by the LangGraph harness using
+    the same thresholds defined in new_AgentTestConfig.
+  - Power BI (Guide 04) continues to read from Dataverse — the harness writes
+    EvalRun and EvalResult records back to the same tables.
+
+The LangGraph harness is an augmentation layer, not a replacement.
+
+
+SECTION 3: ANALYSIS OF THE EXISTING FRAMEWORK (GUIDES 01-06)
+--------------------------------------------------------------
+
+A detailed review of all six design guides was conducted. Key findings per guide:
+
+3.1 Guide 01 — Dataverse Schema and Setup
+
+  The schema is well-designed. Key tables:
+    - new_EvalRun:     Top-level container for a test execution batch
+    - new_EvalResult:  One record per test case result, with all KPI columns
+    - new_EvalArtifact: Links results to stored files (raw, cleaned, exception)
+    - new_TestCase:    Test corpus (inputs, ground truth, test level classification)
+    - new_AgentTestConfig: Per-agent threshold configuration for gate decisions
+
+  LangGraph interaction: The harness reads from new_TestCase and new_AgentTestConfig
+  via OData v4 at scope_node startup. It writes new_EvalRun (on start) and
+  new_EvalResult (after evaluation_node scores each result) via the Dataverse client.
+
+  The publisher prefix ("new_" by default) is configurable via the DATAVERSE_PUBLISHER_PREFIX
+  environment variable so the harness works with any organisation's prefix.
+
+3.2 Guide 02 — Power Automate Dual-Flow Architecture
+
+  The v2.0 dual-flow split is the key architectural feature:
+    - AgentFlow-FileUpload-Adapter:  PVA trigger only — translates topic variables
+      into the InputContract. This flow is NOT called by the LangGraph harness.
+    - CloudFlow-FileUpload-Core:      HTTP trigger — contains all business logic
+      (Gates 1–7), scoring, Dataverse writes. This IS what the harness calls.
+
+  The InputContract and OutputContract are the stable API boundary. Guide 02
+  explicitly states these must be additive-only for backward compatibility.
+  The LangGraph harness enforces this by using the contracts as Pydantic models.
+
+  The IsTestMode flag (Guide 02 Section 3) is always set to True by the harness.
+  This ensures the flow executes the full production code path without writing
+  real business data. IsTestData tagging and cleanup (Guide 06 Section 6) applies.
+
+  Gate 7 of the Core flow (scoring) returns KPI scores in the OutputContract.
+  The evaluation_node uses these as inputs to the LLM scoring prompt, cross-
+  checking the flow's own scoring against the LLM's independent assessment.
+
+3.3 Guide 03 — Scoring and Evaluation Framework
+
+  The weighted formula (0-100) and its five components:
+    - TaskSuccess:        30 points (binary — complete the user's task)
+    - GroundingScore:     15 points (0.00-1.00 — faithfulness of AI content)
+    - ToolCorrectness:    20 points (0.00-1.00 — right gates, right order)
+    - UpsertCorrectness:  20 points (0.00-1.00 — correct Create/Update/Skip)
+    - UX Score:           15 points (latency within SLO, efficient turn count)
+
+  The Safety Gate is an absolute override: any trigger condition sets IsHardFail=True
+  regardless of the numeric score.
+
+  The grounding score is acknowledged as requiring human annotation in Phase 1.
+  The LangGraph evaluation_node replaces this with LLM-automated grounding scoring
+  per the same KPI definition from Guide 03 Section 2.
+
+  The deterministic formula is preserved in the evaluation_node as a verification
+  check: after the LLM produces its scores, the formula is recomputed and if the
+  LLM's overall_score deviates by more than 5 points from the formula result, a
+  calibration warning is logged. The formula result takes precedence over the LLM's
+  own aggregate, ensuring consistency with the Guide 03 definition.
+
+3.4 Guide 04 — Power BI Monitoring Dashboard
+
+  The Power BI dashboard reads from the same Dataverse tables written by the harness.
+  No changes are required to the dashboard. The harness triggers a Power BI dataset
+  refresh (via REST API, Guide 04 Section 6) at the end of each run so the dashboard
+  reflects the latest results immediately.
+
+  The harness produces EvalRun records with the same field values that the dashboard's
+  DAX measures reference (OverallScore, ScoreDelta, PassCount, FailCount, HardFailCount).
+
+3.5 Guide 05 — Smoke Test Agent and Flow
+
+  The smoke test is the mandatory precondition for any regression harness run.
+  Guide 05 Section 7 specifies a 60-minute freshness window: if the latest
+  SmokeTestRun record is older than 60 minutes, the harness must treat it as
+  a platform failure and block.
+
+  The platform_health_node (Node 2) implements this check. Rather than invoking
+  the smoke test agent directly (which would require Direct Line), it reads the
+  most recent record from new_SmokeTestLog in Dataverse — the same record that
+  the scheduled smoke test flow (Guide 05 Section 4) writes after each run.
+
+  This approach is consistent with Guide 05's intent and avoids coupling the
+  test harness to the smoke test's Direct Line session management.
+
+3.6 Guide 06 — Multi-Agent Testing Pipeline
+
+  The guide defines three harness architecture options:
+    - Option A: Power Automate Scheduled Cloud Flow (Phase 1)
+    - Option B: Azure DevOps Pipeline (mature CI/CD)
+    - Option C: Azure Function + Queue (high-volume parallel)
+
+  The LangGraph harness represents a new Option D for Phase 1: local Python
+  execution with full LLM augmentation, wrapping the Option A infrastructure.
+
+  Test level classification (Guide 06 Section 2):
+    - L1 (85%+): HTTP direct to CloudFlow-FileUpload-Core — deterministic
+    - L2: Single-turn Direct Line conversation
+    - L3: Multi-turn Direct Line conversation
+    - L4: Complex cross-agent scenario
+
+  The harness implements L1 execution in Phase 1. L2-L4 are stubbed as skipped
+  with a clear error message. Phase 2 will implement Direct Line session management
+  using the microsoft-agents-copilotstudio-client package already installed in
+  the .venv environment.
+
+  The 7 CI/CD quality gates (Guide 06 Section 7) are evaluated exactly as defined
+  in gate_decision_node:
+    Gate 1: Any IsHardFail = True
+    Gate 2: Task success rate < threshold (default 90%)
+    Gate 3: Validation pass rate < threshold (default 95%)
+    Gate 4: Average upsert correctness < threshold (default 95%)
+    Gate 5: P95 latency > SLO (default 30,000ms)
+    Gate 6: Score delta < regression threshold (default -5.0 points vs baseline)
+    Gate 7: Previously passing test case now fails
+
+
+SECTION 4: ARCHITECTURE DECISIONS
+-----------------------------------
+
+The following decisions were made collaboratively during this session:
+
+DECISION 1: Execution host — Local (exploration phase)
+  The LangGraph orchestrator runs locally in the Python virtual environment
+  for exploration. MemorySaver (in-memory checkpointing) is used. When moving
+  to production, the host would migrate to Azure Functions (serverless, event-driven)
+  and the checkpointer would be replaced with a durable option (SqliteSaver or
+  PostgresSaver or an Azure-backed store).
+
+DECISION 2: LLM role — Fully augmented
+  The LLM is used for:
+    a. Grounding scoring (KPI 2): automated replacement for human annotation
+    b. All evaluation scoring: each KPI scored by the LLM per Guide 03 definitions
+    c. Root cause analysis: structured failure pattern identification and severity
+    d. Test case generation: candidate new TestCase records from failure patterns
+
+  The deterministic formula from Guide 03 Section 3 is retained as a verification
+  layer on top of the LLM scoring (formula result takes precedence for overall_score).
+
+DECISION 3: Power Automate relationship — Wrap, not replace
+  The existing CloudFlow-FileUpload-Core is called via HTTP. The PA dual-flow
+  architecture is unchanged. The LangGraph harness is an orchestration layer,
+  not a reimplementation of business logic.
+
+DECISION 4: Goal — Extend existing guides
+  The outputs of this session and the implementation are intended to extend
+  the existing 6-guide framework, not replace it. This document and the
+  implementation form the basis for a future Guide 07 (LangGraph harness design
+  and local setup).
+
+
+SECTION 5: IMPLEMENTATION DESCRIPTION
+---------------------------------------
+
+The full LangGraph implementation was built during this session and placed in the
+pipelines/ folder within the workspace root.
+
+5.1 File Structure
+
+  pipelines/
+  ├── __init__.py
+  ├── config.py                  Pydantic-settings configuration. All environment
+  │                              variables read here. Exposes settings.table[] dict
+  │                              for Dataverse table name resolution with publisher prefix.
+  ├── graph.py                   StateGraph assembly. build_graph() function. Registers
+  │                              all 8 nodes, static edges, and 3 conditional edge sets.
+  ├── run_graph.py               CLI entrypoint. Streams graph events, handles
+  │                              NodeInterrupt for human-in-the-loop, prints final report.
+  ├── .env.example               Environment variable template. Copy to .env.
+  ├── schemas/
+  │   ├── __init__.py
+  │   ├── state.py               TestOrchestratorState (TypedDict), TestCase, EvalResultRecord,
+  │   │                          EvalRunSummary, GateVerdicts. All fields aligned to Guide 01
+  │   │                          Dataverse column logical names.
+  │   ├── contracts.py           InputContract and OutputContract Pydantic models.
+  │   │                          Direct implementation of Guide 02 Section 2A schemas.
+  │   └── scoring.py             LLMEvalOutput, RootCauseOutput, GeneratedTestCase.
+  │                              Used as structured_output response_format for LLM calls.
+  ├── tools/
+  │   ├── __init__.py
+  │   ├── dataverse.py           Dataverse OData v4 client. MSAL client credentials auth.
+  │   │                          Reads: TestCase, AgentTestConfig, SmokeTestLog, baseline EvalRun.
+  │   │                          Writes: EvalRun (create + update), EvalResult (per test case).
+  │   └── power_automate.py      CoreFlowClient for L1 HTTP invocation. stub_l2_l4_test()
+  │                              for Phase 1. Uses httpx with 120s timeout.
+  └── nodes/
+      ├── __init__.py
+      ├── scope.py               Node 1
+      ├── platform_health.py     Node 2
+      ├── test_dispatch.py       Node 3
+      ├── evaluation.py          Node 4
+      ├── gate_decision.py       Node 5
+      ├── root_cause.py          Node 6
+      ├── human_review.py        Node 7
+      └── test_gen.py            Node 8
+
+5.2 Shared State — TestOrchestratorState
+
+  The state TypedDict is the single object threaded through every node. Key fields:
+
+  run_id, agent_id, agent_version, environment, dataset_name
+    — Run identity. Maps to new_EvalRun Dataverse columns.
+
+  test_config
+    — Dict of gate thresholds loaded from new_AgentTestConfig.
+    — Keys: min_task_success_rate, min_validation_pass_rate, min_upsert_correctness,
+            max_p95_latency_ms, score_drop_threshold.
+
+  test_queue: list[TestCase]
+    — All test cases loaded from new_TestCase for the agent.
+
+  smoke_test_status: str
+    — Platform health result. Values: OK | DEGRADED | FAILED | STALE
+
+  results: list[EvalResultRecord]
+    — One record per test case after dispatch. Populated by test_dispatch_node.
+    — Scores added by evaluation_node.
+
+  eval_run_summary: EvalRunSummary
+    — Aggregate stats. Mirrors new_EvalRun columns. Updated by evaluation_node.
+
+  gate_verdicts: GateVerdicts
+    — 7 boolean flags (one per gate). any_blocked property for routing.
+
+  deployment_decision: str
+    — Values: PASS | BLOCK | PENDING_HUMAN
+
+  failure_severity: str
+    — Values: LOW | HIGH | CRITICAL. Set by root_cause_node. Drives routing edge.
+
+  retry_count: int
+    — Incremented each time root_cause_node routes back to test_dispatch_node.
+    — Capped at MAX_RETRY_COUNT (default 2) to prevent infinite loops.
+
+  human_review_required: bool
+    — Set by root_cause_node when severity = HIGH.
+
+  human_decision: str
+    — Set after NodeInterrupt resume. Values: approve | reject.
+
+  root_cause_log: list[str]
+    — Cumulative log of root cause analysis summaries across all retry attempts.
+
+  generated_test_cases: list[dict]
+    — Candidate new TestCase records from test_gen_node. Human review required
+    — before writing to Dataverse.
+
+5.3 Node Design
+
+  NODE 1 — scope_node (pipelines/nodes/scope.py)
+  ------------------------------------------------
+  Reads Dataverse to populate the run context. Three operations:
+    1. get_agent_test_config(agent_id) → thresholds
+    2. get_test_cases(agent_id) → test_queue
+    3. get_baseline_eval_run(agent_id) → baseline EvalRun for regression delta
+
+  Creates the initial EvalRunSummary with run_id, timestamps, and baseline reference.
+  Falls back to safe defaults if Dataverse calls fail (errors logged to state.errors).
+
+  NODE 2 — platform_health_node (pipelines/nodes/platform_health.py)
+  -------------------------------------------------------------------
+  Implements the Guide 05 Section 7 smoke test precondition:
+    1. Reads the latest new_SmokeTestLog record from Dataverse.
+    2. Checks status: must be OK or DEGRADED (not FAILED).
+    3. Checks freshness: last_run must be within SMOKE_TEST_FRESHNESS_MINUTES (default 60).
+    4. If STALE or FAILED: sets deployment_decision = BLOCK and returns.
+
+  Conditional edge (route_after_platform_health):
+    - HEALTHY → test_dispatch_node
+    - FAILED/STALE → END (early termination, resources not wasted on a broken platform)
+
+  NODE 3 — test_dispatch_node (pipelines/nodes/test_dispatch.py)
+  ---------------------------------------------------------------
+  Executes all test cases in test_queue:
+    - L1 tests: parallel HTTP POST to CloudFlow-FileUpload-Core via CoreFlowClient.
+      Uses ThreadPoolExecutor with MAX_PARALLEL_L1 workers (default 10).
+      IsTestMode=True always. Collects OutputContract responses into EvalResultRecord.
+    - L2/L3/L4 tests: stubbed as skipped with explanatory error message (Phase 2).
+
+  Scores are NOT computed here. Raw flow output only. evaluation_node scores them.
+
+  NODE 4 — evaluation_node (pipelines/nodes/evaluation.py)
+  ---------------------------------------------------------
+  For each non-skipped EvalResultRecord, calls the LLM (Azure OpenAI) with:
+    - A structured prompt containing the OutputContract, TestCase ground truth,
+      and KPI definitions verbatim from Guide 03 Section 2.
+    - response_format=LLMEvalOutput for guaranteed JSON schema compliance.
+    - temperature=0.0 for deterministic scoring.
+
+  After LLM scoring:
+    - Deterministic formula verification: formula is recomputed and logged.
+    - If LLM's overall_score deviates >5 points from formula: calibration warning.
+    - Formula result is authoritative (stored as overall_score in EvalResultRecord).
+
+  After all results are scored:
+    - EvalRunSummary aggregates are recomputed: pass_count, fail_count,
+      hard_fail_count, overall_score, P95 latency.
+
+  NODE 5 — gate_decision_node (pipelines/nodes/gate_decision.py)
+  --------------------------------------------------------------
+  Evaluates all 7 CI/CD gates from Guide 06 Section 7 against the scored results.
+  Thresholds are read from state.test_config (loaded from new_AgentTestConfig).
+  Defaults used if Dataverse config is unavailable.
+
+  Gate implementations:
+    Gate 1: sum(r.is_hard_fail for r in active) > 0
+    Gate 2: (pass_count / total) < min_task_success_rate (default 0.90)
+    Gate 3: (tool_correctness >= 0.95 count / total) < min_validation_pass_rate (0.95)
+    Gate 4: avg(upsert_correctness) < min_upsert_correctness (0.95)
+    Gate 5: P95(latency_ms) > max_p95_latency_ms (30,000ms)
+    Gate 6: summary.score_delta < score_drop_threshold (-5.0)
+    Gate 7: any active result where task_success = False
+
+  GateVerdicts.any_blocked determines the conditional edge:
+    - all_pass → test_gen_node (generate new cases, then END)
+    - gate_fail → root_cause_node
+
+  NODE 6 — root_cause_node (pipelines/nodes/root_cause.py)
+  ---------------------------------------------------------
+  Called when one or more gates fail. LLM receives:
+    - List of blocked gate names
+    - Failing test case details (name, flow_status, gate_failed, scores, failure_reason)
+    - Current retry_count vs max_retry_count
+
+  LLM produces RootCauseOutput with:
+    - summary: 1-3 sentence explanation of the dominant failure pattern
+    - failure_pattern: taxonomy label (e.g. "SchemaMismatch affecting 60% of cases")
+    - severity: LOW | HIGH | CRITICAL
+    - recommended_actions: ordered remediation steps for the development team
+    - retry_likely_to_help: True only for transient failures (latency spike, blip)
+    - deployment_recommendation: PASS | BLOCK (LLM independent recommendation)
+
+  If retry_count >= MAX_RETRY_COUNT: severity forced to CRITICAL regardless of LLM.
+
+  Conditional edge (route_after_root_cause):
+    - critical → test_gen_node (generate new tests, then END with BLOCK)
+    - high     → human_review_node (operator decision required)
+    - retry    → test_dispatch_node (re-run all tests, increment retry_count)
+
+  NODE 7 — human_review_node (pipelines/nodes/human_review.py)
+  -------------------------------------------------------------
+  Implements the pre-deployment human approval gate.
+  Uses LangGraph interrupt() to suspend the graph and return a review payload
+  to the calling process (CLI, API, or notebook):
+
+    Review payload contents:
+      - Agent identity (agent_id, agent_version, environment)
+      - Overall score and score delta vs baseline
+      - Blocked gate names (from GateVerdicts)
+      - Root cause log (all prior RCA summaries)
+      - Instructions for operator
+
+  On resume, human_decision is read from state:
+    - "approve" → deployment_decision = PASS (operator overrides gate block)
+    - "reject"  → deployment_decision = BLOCK (gate block confirmed)
+
+  The CLI entrypoint (run_graph.py) catches NodeInterrupt, displays the payload,
+  prompts for input, and resumes the graph via graph.invoke({human_decision: ...}).
+
+  NODE 8 — test_gen_node (pipelines/nodes/test_gen.py)
+  -----------------------------------------------------
+  Called after every run (pass or block) when failures were observed.
+  The LLM analyses failure_reason patterns and root_cause_log to generate 3-5
+  candidate new TestCase records.
+
+  Each GeneratedTestCase includes:
+    - name, test_set, test_level, rationale
+    - input_file_description (enough detail for a human to construct the file)
+    - expected_task_success, expected_gate_failed, expected row counts
+    - priority: High | Medium | Low (review queue priority)
+
+  Generated cases are stored in state.generated_test_cases and printed in the
+  final report. They are NOT automatically written to Dataverse — they require
+  human review before being added to the new_TestCase table.
+
+5.4 Routing Logic Summary
+
+  The three conditional edge functions implement the graph's adaptive behaviour:
+
+  route_after_platform_health (after Node 2):
+    smoke_test_status in (FAILED, STALE) → blocked → END
+    else → healthy → test_dispatch_node
+
+  route_after_gate_decision (after Node 5):
+    deployment_decision == PASS → all_pass → test_gen_node
+    else → gate_fail → root_cause_node
+
+  route_after_root_cause (after Node 6):
+    severity == CRITICAL → critical → test_gen_node
+    human_review_required OR severity == HIGH → high → human_review_node
+    severity == LOW AND retry_count < MAX_RETRY_COUNT → retry → test_dispatch_node
+
+5.5 InputContract and OutputContract
+
+  The Pydantic models in pipelines/schemas/contracts.py are a direct Python
+  implementation of the schemas defined in Guide 02 Section 2A.
+
+  InputContract (sent to CloudFlow-FileUpload-Core):
+    ConversationId, SessionId, FileName, FileContentBase64, FileMimeType,
+    UserIntent, UserMessage, AgentId, AgentVersion, Channel, IsTestMode,
+    TestCaseId, ContractVersion
+
+  OutputContract (returned by CloudFlow-FileUpload-Core):
+    FlowStatus, GateFailed, TotalRows, ValidRows, InvalidRows, ParseSuccess,
+    OverallScore, TaskSuccess, GroundingScore, ToolCorrectness, UpsertCorrectness,
+    IsHardFail, SafetySeverity, LatencyMs, ConversationId,
+    ExceptionReportUrl, CleanedFileUrl, ErrorMessage, ErrorCode,
+    ContractVersion, TestCaseId
+
+  ContractVersion is echoed back in the OutputContract. The harness logs a
+  warning if the returned version does not match the expected version (2.0).
+
+5.6 Dataverse Client
+
+  pipelines/tools/dataverse.py implements a thin OData v4 HTTP client using:
+    - MSAL ConfidentialClientApplication with client credentials (App Registration)
+    - Token caching with expiry tracking (refreshes 60 seconds before expiry)
+    - Publisher prefix resolution for all table and column logical names
+
+  Read operations:
+    get_test_cases(agent_id, test_set=None)         → list[TestCase]
+    get_agent_test_config(agent_id)                 → dict (thresholds)
+    get_latest_smoke_test()                         → dict (status, last_run, latency)
+    get_baseline_eval_run(agent_id)                 → dict or None
+
+  Write operations:
+    create_eval_run(summary: EvalRunSummary)        → str (GUID)
+    update_eval_run(run_id, summary)                → None (PATCH)
+    write_eval_result(run_id, result)               → str (GUID)
+
+5.7 Environment Configuration
+
+  All configuration is externalised to a .env file. The template is at
+  pipelines/.env.example. Required variables:
+
+    AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_DEPLOYMENT,
+    AZURE_OPENAI_API_VERSION
+      — Azure OpenAI resource for LLM calls (gpt-4o recommended)
+
+    DATAVERSE_BASE_URL, DATAVERSE_TENANT_ID, DATAVERSE_CLIENT_ID,
+    DATAVERSE_CLIENT_SECRET, DATAVERSE_SCOPE
+      — Entra ID App Registration authentication for Dataverse OData
+
+    CORE_FLOW_URL, CORE_FLOW_SAS_KEY
+      — CloudFlow-FileUpload-Core HTTP trigger URL and SAS token
+
+    DATAVERSE_PUBLISHER_PREFIX
+      — Custom table prefix (default "new_"). Match your Guide 01 setup.
+
+    SMOKE_TEST_FRESHNESS_MINUTES (default 60)
+    MAX_PARALLEL_L1 (default 10)
+    MAX_RETRY_COUNT (default 2)
+
+5.8 CLI Usage
+
+  Copy .env.example to .env and fill in credentials, then:
+
+    python -m pipelines.run_graph \
+        --agent-id  <AGENT_GUID> \
+        --version   "1.0" \
+        --env       Dev \
+        --dataset   Golden
+
+  To resume a checkpointed run (e.g. after a human_review_node interrupt):
+    python -m pipelines.run_graph \
+        --agent-id  <AGENT_GUID> \
+        --version   "1.0" \
+        --env       Dev \
+        --dataset   Golden \
+        --thread-id <THREAD_UUID_FROM_PRIOR_RUN>
+
+5.9 Graph Compilation Verification
+
+  The graph was compiled and verified during this session. The draw_mermaid()
+  output confirmed the correct node registrations and edge topology:
+
+    Nodes:
+      __start__, scope_node, platform_health_node, test_dispatch_node,
+      evaluation_node, gate_decision_node, root_cause_node,
+      human_review_node, test_gen_node, __end__
+
+    Edges (static):
+      START → scope_node
+      scope_node → platform_health_node
+      test_dispatch_node → evaluation_node
+      evaluation_node → gate_decision_node
+      human_review_node → test_gen_node
+      test_gen_node → END
+
+    Edges (conditional):
+      platform_health_node → [blocked→END, healthy→test_dispatch_node]
+      gate_decision_node   → [all_pass→test_gen_node, gate_fail→root_cause_node]
+      root_cause_node      → [critical→test_gen_node, high→human_review_node, retry→test_dispatch_node]
+
+
+SECTION 6: DEPENDENCIES AND ENVIRONMENT
+-----------------------------------------
+
+All dependencies were already present in the .venv virtual environment (Python 3.14.3).
+No new packages were installed during this session. Key packages used:
+
+  langgraph (1.0.9)          — graph execution engine, StateGraph, interrupt, MemorySaver
+  langchain-core (1.2.16)    — message types, structured output support
+  openai (2.24.0)            — Azure OpenAI client, beta.chat.completions.parse
+  pydantic (2.13.0b2)        — schema validation, BaseModel, TypedDict
+  pydantic-settings (2.13.1) — .env file loading, Settings class
+  httpx (0.28.1)             — async-capable HTTP client for Core flow invocation
+  msal (1.35.0)              — Entra ID token acquisition (client credentials flow)
+  microsoft-agents-copilotstudio-client (0.9.0.dev1) — Direct Line (Phase 2)
+
+
+SECTION 7: PHASED ROADMAP
+---------------------------
+
+PHASE 1 (current — this session):
+  - LangGraph graph implemented and compiled
+  - L1 HTTP invocation via CoreFlowClient
+  - LLM-augmented evaluation, root cause, and test generation
+  - Human-in-the-loop approval via interrupt()
+  - Dataverse read/write via OData v4
+  - MemorySaver checkpointing
+  - CLI entrypoint
+
+PHASE 2 (next):
+  - Implement L2/L3/L4 test invocation using microsoft-agents-copilotstudio-client
+    (Direct Line session management as defined in Guide 06 Section 3B)
+  - Add SqliteSaver or PostgresSaver for durable checkpointing
+  - Implement Power BI dataset refresh trigger at graph END (Guide 04 Section 6)
+  - Implement cross-agent consistency validation (Guide 06 Section 5)
+  - Add App Insights custom event emission matching Guide 02 Section 2.8 schema
+
+PHASE 3 (production):
+  - Host as Azure Function (HTTP trigger or Timer trigger)
+  - Connect to Azure Key Vault for Core flow URL and SAS key
+  - Replace MemorySaver with Azure Cosmos DB or Azure SQL checkpointer
+  - Integrate with Azure DevOps pipeline as a pre-deployment gate step
+  - Add parallelisation for multiple agents in the same run
+
+
+SECTION 8: OPEN QUESTIONS AND DECISIONS DEFERRED
+--------------------------------------------------
+
+The following items were identified but not resolved during this session:
+
+  1. L2/L3/L4 Direct Line implementation:
+     The microsoft-agents-copilotstudio-client package is installed and available
+     but the Direct Line session + polling pattern from Guide 06 Section 3B has
+     not been implemented. Deferred to Phase 2.
+
+  2. Power BI refresh trigger:
+     The guide references a REST API call to trigger a dataset refresh at run end.
+     This has not been implemented in the current harness. Deferred to Phase 2.
+
+  3. Cross-agent consistency validation:
+     Guide 06 Section 5 defines 4 consistency checks across agents sharing the same
+     file processing standard. The current harness runs one agent per invocation.
+     Multi-agent orchestration deferred to Phase 2.
+
+  4. Baseline EvalRun selection logic:
+     The current implementation selects the most recent Completed EvalRun as the
+     baseline. Guide 03 Section 5 describes a more nuanced baseline promotion process.
+     Full baseline methodology deferred for refinement in Phase 2.
+
+  5. ScoreDelta calculation:
+     The EvalRunSummary.score_delta field is not yet computed in the current
+     implementation (requires reading the baseline EvalRun's overall_score and
+     comparing it to the current run's overall_score). This logic needs to be
+     added to evaluation_node or a post-evaluation node. Deferred.
+
+  6. Guide 07 authoring:
+     A new Guide 07 for the LangGraph harness design and local setup was identified
+     as the appropriate documentation artefact for this implementation. The content
+     of this change control document and the code itself constitute the source
+     material for Guide 07. Authoring deferred to a subsequent session.
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================
+Recorded by: GitHub Copilot (Claude Sonnet 4.6)
+Session Date: February 26, 2026
+Workspace: C:\Users\AI Engine\Documents\CoPilot Agents
+================================================================================

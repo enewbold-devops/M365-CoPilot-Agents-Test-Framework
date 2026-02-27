@@ -1,8 +1,8 @@
 # M365 Copilot Studio Agent Framework
-## Monitoring · Scoring · Evaluation · Testing
+## Monitoring · Scoring · Evaluation · Testing · LangGraph Orchestration
 ### Session Analysis & Implementation Methodology
-**Date:** February 24, 2026  
-**Scope:** End-to-end design session — from discovery to full implementation specification
+**Sessions:** February 24, 2026 (Framework Design) · February 26, 2026 (LangGraph Augmentation)  
+**Scope:** End-to-end design, implementation specification, and LangGraph orchestration layer
 
 ---
 
@@ -24,26 +24,35 @@
 14. [Phased Rollout Plan](#14-phased-rollout-plan)
 15. [Platform Observability Stack](#15-platform-observability-stack)
 16. [Key Decisions Log](#16-key-decisions-log)
-17. [Six-Guide Deliverables Reference](#17-six-guide-deliverables-reference)
+17. [Guide Deliverables Reference](#17-guide-deliverables-reference)
+18. [LangGraph Orchestration — Strategy and Rationale](#18-langgraph-orchestration--strategy-and-rationale)
+19. [LangGraph Graph Architecture](#19-langgraph-graph-architecture)
+20. [LangGraph Implementation — pipelines/ Structure](#20-langgraph-implementation--pipelines-structure)
+21. [LangGraph Node Design Reference](#21-langgraph-node-design-reference)
+22. [LangGraph Routing Logic](#22-langgraph-routing-logic)
+23. [LangGraph Phased Roadmap](#23-langgraph-phased-roadmap)
 
 ---
 
 ## 1. Executive Summary
 
-This document captures the complete analysis and implementation methodology developed during a design session on February 24, 2026. The session produced a full, production-ready framework for monitoring, scoring, evaluating, and testing Microsoft 365 Copilot Studio agents — with a specific focus on agents that process **file attachments** (CSV, XLSX, XML, PDF) submitted through conversations.
+This document captures the complete analysis and implementation methodology developed across two design sessions. The first session (February 24, 2026) produced a full, production-ready Power Platform framework for monitoring, scoring, evaluating, and testing Microsoft 365 Copilot Studio agents — with specific focus on agents that process **file attachments** (CSV, XLSX, XML, PDF). The second session (February 26, 2026) augmented that framework with a **LangGraph orchestration layer**: a Python-based stateful graph that wraps the Power Automate infrastructure and adds LLM-powered evaluation, root cause analysis, adaptive retry, human-in-the-loop approval gates, and dynamic test case generation.
 
-The framework spans six implementation domains delivered as detailed narrative guides:
+The framework spans seven implementation domains:
 
-| Guide | Domain | Core Purpose |
-|-------|---------|--------------|
-| 01 | Dataverse Schema | The evaluation data warehouse |
-| 02 | Power Automate & Agent Flow | The processing and telemetry layer |
-| 03 | Scoring & Evaluation | The quality measurement model |
-| 04 | Power BI Dashboard | The single pane of glass |
-| 05 | Smoke Test Agent | Platform health validation |
-| 06 | Multi-Agent Testing Pipeline | Deployment gate & test orchestration |
+| Guide | Domain | Core Purpose | Technology |
+|-------|---------|--------------|------------|
+| 01 | Dataverse Schema | The evaluation data warehouse | Dataverse OData v4 |
+| 02 | Power Automate & Agent Flow | The processing and telemetry layer | Power Automate (dual-flow) |
+| 03 | Scoring & Evaluation | The quality measurement model | Formula + LLM scoring |
+| 04 | Power BI Dashboard | The single pane of glass | Power BI + DAX |
+| 05 | Smoke Test Agent | Platform health validation | Copilot Studio + Cloud Flow |
+| 06 | Multi-Agent Testing Pipeline | Deployment gate & test orchestration | PA / Azure DevOps |
+| 07 *(planned)* | LangGraph Orchestration Harness | LLM-augmented stateful test orchestration | LangGraph + Python |
 
-> **Core Principle:** All evaluation data lives in Dataverse. All telemetry lives in App Insights. All governance evidence lives in Purview. Power BI joins them into a single operational view.
+> **Core Principles:**
+> - All evaluation data lives in Dataverse. All telemetry lives in App Insights. All governance evidence lives in Purview. Power BI joins them into a single operational view.
+> - The LangGraph harness **wraps** the Power Automate dual-flow architecture — it calls `CloudFlow-FileUpload-Core` via HTTP and writes results back to the same Dataverse tables. Nothing in the PA layer changes.
 
 ---
 
@@ -961,12 +970,16 @@ These are the significant design choices made during this session and the ration
 | 10 | **UserFeedback abstains score 0.5, not 0** | Abstentions (no feedback submitted) are common and should not penalize an agent. Only explicit thumbs-down is a negative signal. |
 | 11 | **GroundingScore defaults to 1.0 when no AI step ran** | Agents that don't use AI cannot be penalized for an unused capability. The weight still reflects the full possible score. |
 | 12 | **Baseline captured after each successful production release** | Regression is only meaningful relative to a known-good state. A rolling comparison ensures the baseline reflects actual current expectations. |
+| 13 *(Feb 26)* | **LangGraph harness hosts on Local (MemorySaver) for Phase 1; Azure Function for production** | Keeps the developer loop fast. MemorySaver checkpointing requires no infrastructure. Azure Function promotion follows the same Dataverse-backed deployment gate pattern introduced in Guide 06. |
+| 14 *(Feb 26)* | **LLM role is fully augmented — grounding, all five KPI scores, root cause analysis, test case generation** | The Power Automate flows produce raw outputs. The LangGraph evaluation node applies the Guide 03 formula deterministically and uses LLM structured output for confidence-weighted KPI scoring. LLM score deviating >5 points from the formula triggers a calibration warning; formula is authoritative. |
+| 15 *(Feb 26)* | **LangGraph wraps Power Automate via HTTP — does not replace it** | The PA dual-flow architecture (`AgentFlow-FileUpload-Adapter` + `CloudFlow-FileUpload-Core`) already owns the agent invocation path, telemetry writes, and Dataverse upserts. The LangGraph harness calls the stable `InputContract`/`OutputContract` HTTP surface and then post-processes; no PA changes required. |
+| 16 *(Feb 26)* | **Goal is to extend existing Guides (not replace), with Guide 07 as the new LangGraph harness guide** | All arch decisions from Guide 01–06 are preserved intact. Guide 07 documents the Python `pipelines/` module as a first-class deliverable alongside the Power Platform guides. |
 
 ---
 
-## 17. Six-Guide Deliverables Reference
+## 17. Guide Deliverables Reference
 
-The six guides written to **context/2 - Design/** are the implementation specification for everything analyzed in this session. They are designed to be read in order but are independently actionable.
+All guides are written to **context/2 - Design/** and are the implementation specification for everything covered in these sessions. Guides 01–06 cover the Power Platform stack. Guide 07 *(planned)* documents the LangGraph orchestration harness.
 
 ```mermaid
 flowchart LR
@@ -976,6 +989,7 @@ flowchart LR
     G04["📒 Guide 04<br/>Power BI Dashboard<br/>Requires Guide 01 & 03"]
     G05["📔 Guide 05<br/>Smoke Test Agent<br/>Requires Guide 01 & 02"]
     G06["📕 Guide 06<br/>Multi-Agent Pipeline<br/>& Deployment Plan<br/>Requires all prior guides"]
+    G07["🤖 Guide 07<br/>LangGraph Harness<br/>PLANNED<br/>Requires all prior guides"]
 
     G01 --> G02
     G02 --> G03
@@ -988,6 +1002,7 @@ flowchart LR
     G03 --> G06
     G04 --> G06
     G02 --> G06
+    G06 --> G07
 ```
 
 | Guide | File | Primary Phase | Est. Build Time |
@@ -998,10 +1013,303 @@ flowchart LR
 | 04 — Power BI Dashboard | `Guide-04-Power-BI-Monitoring-Dashboard.txt` | Phase 2, Week 3 | 3–5 days |
 | 05 — Smoke Test Agent | `Guide-05-Smoke-Test-Agent-and-Flow.txt` | Phase 1, Week 1 | 2–3 days |
 | 06 — Multi-Agent Pipeline | `Guide-06-Multi-Agent-Testing-Pipeline-and-Deployment-Plan.txt` | Phase 2–3 | 8–12 days |
+| 07 — LangGraph Harness *(planned)* | `Guide-07-LangGraph-Orchestration-Harness.txt` | Phase 3 | 5–8 days |
 
 ---
 
-## Quick Reference: Recommended First Week Actions
+## 18. LangGraph Orchestration — Strategy and Rationale
+
+### Why LangGraph?
+
+The Power Platform framework (Guides 01–06) is production-ready for human-supervised testing workflows. However, as the number of agents, test cases, and release cadences grows, three gaps emerge:
+
+| Gap | Power Platform Ceiling | LangGraph Solution |
+|-----|----------------------|--------------------|
+| **Stateful multi-step reasoning** | PA flows are stateless; each run is independent | LangGraph `StateGraph` carries full test state across all 8 nodes |
+| **LLM-as-evaluator** | PA flows write to Dataverse; no LLM scoring | Azure OpenAI `beta.chat.completions.parse` scores all 5 KPIs with structured output |
+| **Adaptive retry with root cause** | PA flows don't diagnose their own failures | `root_cause_node` performs LLM root cause analysis and makes retry/escalate decisions |
+| **Human-in-the-loop gates** | PA flows require manual intervention via email or Teams | LangGraph `interrupt()` suspends the graph and resumes on explicit human approval |
+| **Test case generation from failures** | No mechanism to grow the test corpus from regressions | `test_gen_node` generates 3–5 new `GeneratedTestCase` objects from every failure run |
+| **Cross-run correlation and baseline** | Power BI shows historical trends; no in-run regression detection | `evaluation_node` fetches baseline `EvalRunSummary` and computes `ScoreDelta` live |
+
+### Complementary Relationship with Power Automate
+
+The LangGraph harness is **additive**, not a replacement. The Power Automate dual-flow (`AgentFlow-FileUpload-Adapter` + `CloudFlow-FileUpload-Core`) continues to own:
+- Agent conversation invocation and file passing
+- Gate-by-gate deterministic validation (Gates 1–7 in the Agent Flow)
+- Dataverse upserts for `new_EvalResult`, `new_EvalArtifact`, `new_BatchUpload`
+- App Insights telemetry emission
+- All production traffic handling
+
+The LangGraph harness owns:
+- Orchestrating **which tests run, in what order, and how failures are handled**
+- LLM scoring, root cause analysis, and test generation
+- Human-in-the-loop approval for high-severity gate failures
+- Writing `new_EvalRun` records (the run-level aggregation) back to Dataverse
+- CLI-driven or CI/CD-driven test execution outside the PA environment
+
+```mermaid
+flowchart TD
+    LG["🐍 LangGraph Harness<br/>(pipelines/ module)"]
+    INPUT["InputContract<br/>HTTP POST"]
+    PA_CORE["☁️ CloudFlow-FileUpload-Core<br/>(Power Automate)"]
+    PA_AGENT["🤖 AgentFlow-FileUpload-Adapter<br/>(Copilot Studio + Agent Flow)"]
+    DV["🗄️ Dataverse<br/>new_EvalResult · new_EvalRun"]
+    OAI["🧠 Azure OpenAI<br/>gpt-4o · Structured Output"]
+    PBI["📊 Power BI<br/>Dashboard"]
+
+    LG -->|HTTP POST InputContract| INPUT
+    INPUT --> PA_CORE
+    PA_CORE --> PA_AGENT
+    PA_AGENT -->|OutputContract JSON| PA_CORE
+    PA_CORE -->|Response| LG
+    LG -->|LLM Scoring| OAI
+    OAI -->|LLMEvalOutput| LG
+    LG -->|Write EvalRun| DV
+    PA_CORE -->|Write EvalResult| DV
+    DV --> PBI
+```
+
+---
+
+## 19. LangGraph Graph Architecture
+
+### Graph Topology
+
+The harness is an 8-node `StateGraph` compiled with `MemorySaver` checkpointing. All nodes share a single `TestOrchestratorState` TypedDict.
+
+```mermaid
+stateDiagram-v2
+    [*] --> scope_node
+    scope_node --> platform_health_node
+    platform_health_node --> test_dispatch_node : healthy
+    platform_health_node --> [*] : blocked
+    test_dispatch_node --> evaluation_node
+    evaluation_node --> gate_decision_node
+    gate_decision_node --> test_gen_node : all_pass
+    gate_decision_node --> root_cause_node : gate_fail
+    root_cause_node --> test_gen_node : critical
+    root_cause_node --> human_review_node : high
+    root_cause_node --> test_dispatch_node : retry
+    human_review_node --> test_gen_node
+    test_gen_node --> [*]
+```
+
+### State Schema — `TestOrchestratorState`
+
+All fields are defined in `pipelines/schemas/state.py`. The state object is the single source of truth shared across all 8 nodes.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `agent_id` | `str` | Copilot Studio agent GUID |
+| `agent_version` | `str` | SemVer of agent under test |
+| `environment` | `str` | `dev` / `uat` / `prod` |
+| `test_cases` | `list[TestCase]` | Test corpus loaded from `new_TestCase` |
+| `agent_config` | `dict` | Thresholds from `new_AgentTestConfig` |
+| `eval_results` | `list[EvalResultRecord]` | Raw PA outputs (pre-scoring) |
+| `eval_run_summary` | `EvalRunSummary` | Aggregated KPI means, P95 latency, ScoreDelta |
+| `gate_verdicts` | `GateVerdicts` | Boolean pass/fail for each of the 7 CI/CD gates |
+| `failure_severity` | `FailureSeverity` | `CRITICAL` / `HIGH` / `LOW` |
+| `root_cause_log` | `str` | LLM root cause narrative |
+| `retry_count` | `int` | Number of dispatch retry attempts |
+| `deployment_decision` | `DeploymentDecision` | `PASS` / `BLOCK` / `PENDING` |
+| `eval_run_id` | `str \| None` | Dataverse `new_EvalRun` GUID written by scope_node |
+| `generated_test_cases` | `list[GeneratedTestCase]` | LLM-generated candidate test cases |
+| `baseline_summary` | `EvalRunSummary \| None` | Last successful run (for ScoreDelta) |
+| `smoke_test_status` | `str` | Latest `new_SmokeTestLog` status field |
+
+### LLM Structured Output Schemas (`pipelines/schemas/scoring.py`)
+
+| Schema | Purpose | Key Fields |
+|--------|---------|------------|
+| `LLMEvalOutput` | Per-test-case KPI scoring | `task_success_score`, `grounding_score`, `tool_correctness_score`, `upsert_correctness_score`, `ux_quality_score`, `overall_score`, `eval_confidence` |
+| `RootCauseOutput` | Failure root cause analysis | `primary_cause`, `contributing_factors`, `severity`, `retry_likely_to_help`, `recommended_actions`, `deployment_recommendation` |
+| `GeneratedTestCase` | New test case generation | `test_name`, `input_prompt`, `attachment_type`, `expected_output_summary`, `rationale`, `target_kpi` |
+
+---
+
+## 20. LangGraph Implementation — `pipelines/` Structure
+
+### File Tree
+
+```
+pipelines/
+├── __init__.py
+├── config.py                  ← pydantic-settings, publisher prefix, table name resolution
+├── graph.py                   ← build_graph() + compiled graph singleton
+├── run_graph.py               ← CLI entry point (argparse, interrupt handler)
+├── .env.example               ← all required environment variables
+├── schemas/
+│   ├── __init__.py
+│   ├── state.py               ← TestOrchestratorState + supporting Pydantic models
+│   ├── contracts.py           ← InputContract + OutputContract (Guide 02 Section 2A)
+│   └── scoring.py             ← LLMEvalOutput + RootCauseOutput + GeneratedTestCase
+├── tools/
+│   ├── __init__.py
+│   ├── dataverse.py           ← MSAL auth + OData v4 CRUD methods
+│   └── power_automate.py      ← CoreFlowClient.invoke_l1_test() + L2–L4 stubs
+└── nodes/
+    ├── __init__.py
+    ├── scope.py               ← Node 1: load test corpus + thresholds + baseline
+    ├── platform_health.py     ← Node 2: smoke test freshness check
+    ├── test_dispatch.py       ← Node 3: fan-out L1 HTTP tests (ThreadPoolExecutor)
+    ├── evaluation.py          ← Node 4: LLM KPI scoring + formula verification
+    ├── gate_decision.py       ← Node 5: all 7 Guide 06 CI/CD gates
+    ├── root_cause.py          ← Node 6: LLM root cause + retry routing
+    ├── human_review.py        ← Node 7: LangGraph interrupt() + resume
+    └── test_gen.py            ← Node 8: LLM test case generation from failures
+```
+
+### CLI Usage
+
+```powershell
+# Activate the virtual environment
+.venv\Scripts\Activate.ps1
+
+# Run the harness against a specific agent version
+python -m pipelines.run_graph \
+    --agent-id "<copilot-studio-agent-guid>" \
+    --version "1.2.3" \
+    --env uat \
+    --dataset "L1-FileAttachment-CSV" \
+    --thread-id "run-$(Get-Date -Format yyyyMMdd-HHmmss)"
+```
+
+**CLI arguments:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--agent-id` | *(required)* | Copilot Studio agent GUID from `new_AgentTestConfig` |
+| `--version` | *(required)* | SemVer string (used for ScoreDelta baseline lookup) |
+| `--env` | `dev` | Target environment (`dev` / `uat` / `prod`) |
+| `--dataset` | `default` | Test dataset label for filtering `new_TestCase` records |
+| `--thread-id` | auto-generated UUID | LangGraph checkpoint thread ID (enables resume after interrupt) |
+
+### Environment Variables (`.env` / `.env.example`)
+
+| Variable | Purpose |
+|----------|---------|
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI service URL |
+| `AZURE_OPENAI_API_KEY` | API key for `gpt-4o` deployment |
+| `AZURE_OPENAI_DEPLOYMENT` | Deployment name (default: `gpt-4o`) |
+| `DATAVERSE_URL` | `https://<org>.crm.dynamics.com` |
+| `DATAVERSE_TENANT_ID` | Entra ID tenant GUID |
+| `DATAVERSE_CLIENT_ID` | App registration client ID |
+| `DATAVERSE_CLIENT_SECRET` | App registration secret |
+| `CORE_FLOW_TRIGGER_URL` | `CloudFlow-FileUpload-Core` HTTP trigger URL |
+| `CORE_FLOW_SAS_KEY` | Shared Access Signature key for trigger |
+| `PUBLISHER_PREFIX` | Dataverse publisher prefix (default: `new_`) |
+| `SMOKE_FRESHNESS_MINUTES` | Max age of last smoke test (default: `60`) |
+| `MAX_PARALLEL_L1` | ThreadPoolExecutor workers (default: `5`) |
+| `MAX_RETRY_COUNT` | Root cause retry limit (default: `3`) |
+
+---
+
+## 21. LangGraph Node Design Reference
+
+| Node | File | Guide Reference | LLM Used | Dataverse R/W |
+|------|------|-----------------|----------|---------------|
+| `scope_node` | `nodes/scope.py` | Guide 01 tables, Guide 06 dataset design | No | Read: AgentTestConfig, TestCase, EvalRun (baseline). Write: new EvalRun |
+| `platform_health_node` | `nodes/platform_health.py` | Guide 05 Section 7 (60-min freshness) | No | Read: SmokeTestLog |
+| `test_dispatch_node` | `nodes/test_dispatch.py` | Guide 06 L1–L4 levels, Guide 02 InputContract | No | None (calls PA via HTTP) |
+| `evaluation_node` | `nodes/evaluation.py` | Guide 03 weighted formula + all 5 KPIs | **Yes** — `LLMEvalOutput` | Write: EvalResult per test case |
+| `gate_decision_node` | `nodes/gate_decision.py` | Guide 06 Section 7 — all 7 CI/CD gates | No | Write: EvalRun (gate verdicts) |
+| `root_cause_node` | `nodes/root_cause.py` | Guide 06 failure triage | **Yes** — `RootCauseOutput` | Write: EvalRun (root cause text, severity) |
+| `human_review_node` | `nodes/human_review.py` | Guide 06 human approval gate | No | Write: EvalRun (human decision) |
+| `test_gen_node` | `nodes/test_gen.py` | Guide 06 adaptive test generation | **Yes** — `GeneratedTestCase[]` | None (results stored in state for review) |
+
+### Scoring Formula Verification (Node 4)
+
+The Guide 03 scoring formula is the authoritative source of the `overall_score`. The LLM's `overall_score` is used for calibration monitoring only:
+
+$$\text{Score} = (TaskSuccess \times 30) + (Grounding \times 15) + (ToolCorrectness \times 20) + (UpsertCorrectness \times 20) + (UXQuality \times 15)$$
+
+> If $|\text{LLM score} - \text{Formula score}| > 5$, `evaluation_node` logs a calibration warning. The formula score is written to Dataverse as `new_OverallScore`. The LLM score is stored in `new_LLMOverallScore` for drift tracking.
+
+---
+
+## 22. LangGraph Routing Logic
+
+Three conditional edge functions determine graph flow:
+
+### `route_after_platform_health()`  *(Node 2 → Node 3 or END)*
+
+```
+if smoke_test_status == "PASS" and smoke_test_age <= SMOKE_FRESHNESS_MINUTES:
+    → test_dispatch_node
+else:
+    state.deployment_decision = BLOCK
+    → END
+```
+
+### `route_after_gate_decision()`  *(Node 5 → Node 8 or Node 6)*
+
+```
+if GateVerdicts.any_blocked == False:
+    state.deployment_decision = PASS
+    → test_gen_node
+else:
+    state.deployment_decision = BLOCK
+    → root_cause_node
+```
+
+### `route_after_root_cause()`  *(Node 6 → Node 8, Node 7, or Node 3)*
+
+```
+if retry_count >= MAX_RETRY_COUNT:
+    force severity = CRITICAL
+
+if severity == CRITICAL:             → test_gen_node (hard block)
+if severity == HIGH:                 → human_review_node (interrupt + resume)
+if severity == LOW and retry_likely: → test_dispatch_node (retry)
+else:                                → test_gen_node
+```
+
+> **Human Review Resume:** When `human_review_node` calls `interrupt()`, the CLI catches the `NodeInterrupt` exception, displays the review payload (agent identity, overall score, score delta, blocked gate names, root cause narrative), and prompts for `approve` / `reject`. The graph resumes via `graph.invoke(None, config)` with `human_decision` written to state.
+
+---
+
+## 23. LangGraph Phased Roadmap
+
+The LangGraph harness is implemented in three phases, layered on top of the existing Power Platform phases from Guide 06.
+
+```mermaid
+gantt
+    title LangGraph Orchestration Harness — Phased Rollout
+    dateFormat  YYYY-MM-DD
+    section Phase 1 — L1 Harness (Complete)
+    pipelines/ scaffold & schemas       :done, 2026-02-26, 1d
+    scope, platform_health, dispatch    :done, 2026-02-26, 1d
+    evaluation & gate_decision nodes    :done, 2026-02-26, 1d
+    root_cause & human_review nodes     :done, 2026-02-26, 1d
+    test_gen node & CLI runner          :done, 2026-02-26, 1d
+    Graph compilation verified          :done, 2026-02-26, 1d
+    section Phase 2 — L2/L3/L4 (Direct Line)
+    Direct Line OAuth integration       :2026-03-03, 5d
+    L2 Declarative agent harness        :2026-03-10, 5d
+    L3 Custom engine agent harness      :2026-03-17, 5d
+    L4 Multi-agent topology harness     :2026-03-24, 7d
+    section Phase 3 — Azure Function Promotion
+    Containerise pipelines/ module      :2026-04-07, 3d
+    Azure Function + Durable Functions  :2026-04-10, 5d
+    Azure DevOps pipeline YAML          :2026-04-15, 3d
+    Power BI refresh integration        :2026-04-18, 3d
+    Guide 07 authoring                  :2026-04-21, 5d
+```
+
+### Open Questions for Phase 2 / Guide 07
+
+| # | Question | Impact |
+|---|----------|--------|
+| 1 | **L2/L3/L4 harness architecture** — use `microsoft-agents-copilotstudio-client` Direct Line or mock? | Phase 2 implementation approach |
+| 2 | **Power BI refresh trigger** — should `test_gen_node` trigger a semantic model refresh after writing? | Dashboard freshness SLA |
+| 3 | **Cross-agent consistency gate** — for multi-agent topologies, how is `ScoreDelta` computed across agent boundaries? | Gate 6 definition for L4 tests |
+| 4 | **ScoreDelta baseline selection** — use last successful run for same `agent_id`+`version`, or last run for same `agent_id` regardless of version? | Regression detection sensitivity |
+| 5 | **Generated test case review workflow** — what is the approval mechanism before `GeneratedTestCase` objects are written to `new_TestCase` in Dataverse? | Corpus governance |
+
+---
+
+## Quick Reference: First Week Actions
 
 ```mermaid
 graph TD
@@ -1010,13 +1318,14 @@ graph TD
     DAY3["Day 3<br/>⚙️ Build Smoke Test<br/>Agent Flow<br/>(Guide 05, Section 3)"]
     DAY4["Day 4<br/>⏰ Wire up 30-minute<br/>scheduled smoke test<br/>(Guide 05, Section 4)"]
     DAY5["Day 5<br/>🔗 Build first Agent Flow<br/>for highest-priority agent<br/>Gates 1–4 only first<br/>(Guide 02, Sections 1–2)"]
+    DAY6["Day 6+<br/>🐍 Run LangGraph harness<br/>against Dev environment<br/>(pipelines/ CLI, L1 tests only)"]
 
-    DAY1 --> DAY2 --> DAY3 --> DAY4 --> DAY5
+    DAY1 --> DAY2 --> DAY3 --> DAY4 --> DAY5 --> DAY6
 ```
 
-> **Success Criteria for Week 1:** The smoke test agent runs every 30 minutes with zero P0 alerts. The first production agent's Agent Flow processes a test CSV with `IsTestMode=true` and writes a `new_EvalResult` record to Dataverse. Power BI connects to the Dataverse tables and shows at least one row on Page 1.
+> **Success Criteria for Week 1:** The smoke test agent runs every 30 minutes with zero P0 alerts. The first production agent's Agent Flow processes a test CSV with `IsTestMode=true` and writes a `new_EvalResult` record to Dataverse. The LangGraph harness runs end-to-end in `dev` environment against at least one test case and writes a `new_EvalRun` record. Power BI connects to the Dataverse tables and shows at least one row on Page 1.
 
 ---
 
-*Generated from design session — February 24, 2026*  
+*Generated from design sessions — February 24, 2026 (Framework Design) · February 26, 2026 (LangGraph Augmentation)*  
 *All implementation detail sourced from: m365_copilot_copilot_studio_agents.txt, m365_copilot_copilot_studio_agents_monitoring_evaluations_notes.txt, and session discussion analysis*
