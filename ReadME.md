@@ -1326,6 +1326,3 @@ graph TD
 > **Success Criteria for Week 1:** The smoke test agent runs every 30 minutes with zero P0 alerts. The first production agent's Agent Flow processes a test CSV with `IsTestMode=true` and writes a `new_EvalResult` record to Dataverse. The LangGraph harness runs end-to-end in `dev` environment against at least one test case and writes a `new_EvalRun` record. Power BI connects to the Dataverse tables and shows at least one row on Page 1.
 
 ---
-
-*Generated from design sessions — February 24, 2026 (Framework Design) · February 26, 2026 (LangGraph Augmentation)*  
-*All implementation detail sourced from: m365_copilot_copilot_studio_agents.txt, m365_copilot_copilot_studio_agents_monitoring_evaluations_notes.txt, and session discussion analysis*
